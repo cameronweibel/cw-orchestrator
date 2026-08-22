@@ -427,22 +427,16 @@ cmd_homerows() {
   done
 }
 
-cmd_curline() { # line number and index of the current window, for the refresher
-  have_session || return 0
-  tmux list-windows -t "$SESSION" -F '#{window_index} #{window_active}' \
-    | awk '{n++} $2==1{print n, $1}'
-}
-
 cmd_homelist() { # the left pane process
   local me="$HOME/.claude/bin/cw" refresher
   rm -f "$PORT_FILE"
   (
     # Refresh the list via fzf's listen port, but only when the rows really
     # changed: reloads repaint the pane (flicker) and drift the cursor, so
-    # skipping no-op reloads fixes both. After every reload, snap the
-    # highlight onto the currently displayed chat (the starred row), so the
-    # highlight always shows which chat is open. The star column makes any
-    # current-window change show up in the row hash.
+    # skipping no-op reloads fixes both. The highlight is never moved from
+    # here: an async pos() used to snap it onto the open chat, which could
+    # yank the cursor away in the instant before the user pressed x and
+    # kill the wrong chat. The star column alone marks the open chat now.
     # the refresher must survive anything: one transient failure under the
     # script's errexit killed it silently and froze the list
     set +e +o pipefail
@@ -456,13 +450,6 @@ cmd_homelist() { # the left pane process
       last_hash="$h"
       curl -s -X POST "http://localhost:$p" \
         -d "reload($me __homerows)" >/dev/null 2>&1 || true
-      cur="$("$me" __curline 2>/dev/null || true)"
-      if [[ -n "$cur" ]]; then
-        # after the async reload has settled (same request ordering fails)
-        sleep 0.4
-        curl -s -X POST "http://localhost:$p" \
-          -d "pos(${cur%% *})" >/dev/null 2>&1 || true
-      fi
     done
   ) &
   refresher=$!
@@ -477,7 +464,7 @@ cmd_homelist() { # the left pane process
       --bind "enter:execute-silent($me __open {1})" \
       --bind "m:execute-silent($me __gomaster)+reload($me __homerows)" \
       --bind "n:execute($me __newtask)+reload($me __homerows)" \
-      --bind "x:execute-silent($me __guardkill {1})+reload($me __homerows)" \
+      --bind "x:execute-silent($me __guardkill {1})+reload($me __homerows)+first" \
       --bind 'esc:ignore' || true
     sleep 1
   done
@@ -531,7 +518,6 @@ case "${1:-}" in
   __homerows) cmd_homerows; exit 0 ;;
   __homelist) cmd_homelist; exit 0 ;;
   __open)     shift; cmd_open "${1:-}"; exit 0 ;;
-  __curline)  cmd_curline; exit 0 ;;
   __gomaster) cmd_gomaster; exit 0 ;;
   __guardkill) shift; cmd_guardkill "${1:-}"; exit 0 ;;
   __newtask)  cmd_newtask; exit 0 ;;
