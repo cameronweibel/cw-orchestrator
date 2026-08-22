@@ -225,6 +225,18 @@ attach_to() { # [index]
 
 # busy = the model is working, input = it stopped on a question or permission
 # prompt and needs a human, idle = ready for the next prompt, done = exited.
+# Rendered as one symbol in the lists. The symbol goes through a plain %s
+# (never a padded field): bash printf pads by bytes and the dots are 3 byte
+# UTF-8, so byte padding would break column alignment.
+state_sym() {
+  case "$1" in
+    busy)  printf '●' ;;
+    idle)  printf '○' ;;
+    input) printf '?' ;;
+    done)  printf '×' ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
 window_state() { # index
   local idx="$1" cap
   if [[ "$(tmux display -p -t "$SESSION:$idx" '#{pane_dead}')" == "1" ]]; then
@@ -260,13 +272,13 @@ rows() { # shared by ls and ui (fzf reloads call "cw __rows")
       if (( age >= 60 )); then age="$((age / 60))h"; else age="${age}m"; fi
     else age="?"; fi
     title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
-    printf '%-4s %-11s %-26s %-6s %-5s %s\n' "$idx" "${ws:--}" "$title" "$state" "$age" "${task:--}"
+    printf '%-4s %-11s %-33s %s %-5s %s\n' "$idx" "${ws:--}" "$title" "$(state_sym "$state")" "$age" "${task:--}"
   done
 }
 
 cmd_ls() {
   have_session || { echo "no sessions"; exit 0; }
-  printf '%-4s %-11s %-26s %-6s %-5s %s\n' ID WS TITLE STATE AGE TASK
+  printf '%-4s %-11s %-33s %s %-5s %s\n' ID WS TITLE S AGE TASK
   rows
 }
 
@@ -276,7 +288,7 @@ cmd_ui() {
   local me sel idx
   me="$HOME/.claude/bin/cw"
   sel="$(rows | fzf \
-      --header 'enter attach   ctrl-x kill   ctrl-r refresh   (busy=working, input=needs you, idle=ready, done=finished)' \
+      --header 'enter attach   ctrl-x kill   ctrl-r refresh   (●=working, ?=needs you, ○=ready, ×=finished)' \
       --preview "tmux capture-pane -p -t $SESSION:{1} | awk 'NF{f=1} f'" \
       --preview-window 'right,58%' \
       --bind "ctrl-r:reload($me __rows)" \
@@ -397,7 +409,7 @@ cmd_homerows() {
     else age="?"; fi
     title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
     mark=""; [[ "$active" == "1" ]] && mark="*"
-    printf '%-2s %-10s %-15s %-5s %-3s %s\n' "$idx" "${ws:--}" "${title:0:15}" "$state" "$age" "$mark"
+    printf '%-2s %-10s %-19s %s %-3s %s\n' "$idx" "${ws:--}" "${title:0:19}" "$(state_sym "$state")" "$age" "$mark"
   done
 }
 
@@ -532,7 +544,7 @@ if w="$(resolve_ws "$1")"; then
 fi
 
 if [[ $# -eq 0 ]]; then
-  # Bare "cw work": plain claude-ws in this terminal, no tmux.
+  # Bare "cw hebbian": plain claude-ws in this terminal, no tmux.
   [[ -n "$ws" ]] || { echo "cw: give me a task" >&2; exit 1; }
   exec "$CLAUDE_WS" "$ws"
 fi
