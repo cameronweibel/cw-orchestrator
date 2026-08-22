@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+# cw: workspace routing orchestrator above claude-ws.
+#
+#   cw "task"                 route to a workspace, spawn in tmux, attach
+#   cw -d "task"              same but stay detached
+#   cw <ws> "task"            explicit workspace, skip routing
+#   cw -p "task"              route, run headless (claude -p), print result
+#   cw ls                     list all spawned sessions
+#   cw ui                     arrow key picker with live preview, Enter attaches
+#   cw a [id]                 attach (to a specific session, or the ws session)
+#   cw peek <id> [lines]      show the last lines of a session's screen
+#   cw send <id> "text"       type into a session and press Enter
+#   cw kill <id>              close a session window
+#   cw route "task"           dry run, print the routing decision
+#   cw master                 spawn or attach the master orchestrator session
+#   cw home                   the control room: session list left, chat right
+#
+# Sessions live as windows of the tmux session "ws". tmux is the state.
+set -euo pipefail
+
+PROFILES_DIR="$HOME/.claude/profiles"
+ORC_DIR="$HOME/.claude/orchestrator"
+RULES_MD="$ORC_DIR/routing.md"
+RLOG="$ORC_DIR/routing.log"
+EMPTY_MCP="$ORC_DIR/empty.mcp.json"
+MASTER_MD="$ORC_DIR/master.md"
+REGISTRY="$HOME/.claude/workspaces.json"
+CLAUDE_WS="$HOME/.claude/bin/claude-ws"
+SESSION="ws"
+CONF_MIN="0.7"
+ROUTER_MODEL="haiku"
+PATH_EXPORT="export PATH=\"$HOME/.claude/bin:/opt/homebrew/bin:$HOME/.local/bin:\$PATH\";"
+HOME_SOCKET="cwhome"
+PORT_FILE="$ORC_DIR/.home_port"
+TMUX_BIN="$(command -v tmux)"
+
+# Every cw tmux call targets the default server explicitly. Without this,
+# running cw from inside the cw home outer session (its own socket) would
+# talk to the wrong server via $TMUX.
+tmux() { "$TMUX_BIN" -L default "$@"; }
+
+# ---------- workspace discovery ----------
+workspaces=()
+for f in "$PROFILES_DIR"/*.mcp.json; do
+  [[ -e "$f" ]] || continue
+  b="$(basename "$f")"
+  workspaces+=("${b%.mcp.json}")
+done
+[[ ${#workspaces[@]} -gt 0 ]] || { echo "cw: no profiles in $PROFILES_DIR" >&2; exit 1; }
+
+resolve_ws() {
+  local q="$1" hit="" w
+  for w in "${workspaces[@]}"; do
+    [[ "$w" == "$q" ]] && { echo "$w"; return 0; }
+  done
+  for w in "${workspaces[@]}"; do
+    if [[ "$w" == "$q"* ]]; then
+      [[ -n "$hit" ]] && return 1
+      hit="$w"
+    fi
+  done
+  [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+  return 1
+}
+
+# ---------- routing ----------
+log_route() { # tier ws conf task
+  printf '%s\ttier=%s\tws=%s\tconf=%s\ttask=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "$3" "$4" >> "$RLOG"
+}
+
+route_llm() { # task -> prints "workspace confidence" on success
+  local task="$1" rules prompt out json ws conf
+  if [[ -s "$RULES_MD" ]]; then
+    rules="$(cat "$RULES_MD")"
+  else
+    rules="$(jq -r '.workspaces[] | "- \(.name): \(.description // .notes // "no description")"' "$REGISTRY" 2>/dev/null \
+      || printf -- '- %s\n' "${workspaces[@]}")"
+  fi
+  prompt="You route tasks to one of these workspaces: ${workspaces[*]}.
+
+Routing rules:
+$rules
+
+The task was launched from the folder: $PWD
+
+Task: \"$task\"
+
+Reply with ONLY a JSON object, no other text: {\"workspace\":\"<name>\",\"confidence\":<number 0 to 1>}"
+  out="$(claude -p --model "$ROUTER_MODEL" --strict-mcp-config --mcp-config="$EMPTY_MCP" "$prompt" 2>/dev/null)" || return 1
+  json="$(grep -o '{[^}]*}' <<<"$out" | head -1)"
+  ws="$(jq -r '.workspace // empty' <<<"$json" 2>/dev/null)"
+  conf="$(jq -r '.confidence // 0' <<<"$json" 2>/dev/null)"
+  ws="$(resolve_ws "$ws")" || return 1
+  echo "$ws $conf"
+}
+
+# Sets ROUTED_WS, ROUTED_TIER, ROUTED_CONF or exits.
+route_decide() {
+  local task="$1" ws conf pair
+  if pair="$(route_llm "$task")"; then
+    ws="${pair%% *}"; conf="${pair##* }"
+    if awk -v c="$conf" -v m="$CONF_MIN" 'BEGIN{exit !(c>=m)}'; then
+      ROUTED_WS="$ws"; ROUTED_TIER="agent"; ROUTED_CONF="$conf"
+      log_route agent "$ws" "$conf" "$task"; return 0
+    fi
+  else
+    ws=""; conf="0"
+  fi
+  # Low confidence: ask when interactive, refuse when not.
+  if [[ -t 0 && -t 1 ]]; then
+    echo "cw: not sure which workspace fits (best guess: ${ws:-none}, confidence ${conf})." >&2
+    PS3="Select workspace: "
+    local c
+    select c in "${workspaces[@]}"; do
+      [[ -n "${c:-}" ]] && { ROUTED_WS="$c"; break; }
+    done
+    ROUTED_TIER="picker"; ROUTED_CONF="user"
+    log_route picker "$ROUTED_WS" user "$task"
+  else
+    echo "cw: routing ambiguous for \"$task\" (best guess: ${ws:-none}, confidence ${conf})." >&2
+    echo "cw: rerun with an explicit workspace: cw -d <workspace> \"task\"" >&2
+    log_route refused "${ws:-none}" "$conf" "$task"
+    exit 3
+  fi
+}
+
+# Ask for the general case and write it into routing.md under the right
+# workspace heading, so the router learns from the correction on its own.
+teach_route() { # right_ws task
+  local right="$1" task="$2" rule
+  printf 'cw: what is the general rule? (one sentence, Enter to skip)\n> '
+  IFS= read -r rule || rule=""
+  [[ -n "$rule" ]] || rule="tasks like \"$task\" belong here"
+  if [[ -s "$RULES_MD" ]] && grep -q "^## $right" "$RULES_MD"; then
+    awk -v ws="## $right" -v add="- $rule" '{print} $0 == ws {print add}' \
+      "$RULES_MD" > "$RULES_MD.tmp" && mv "$RULES_MD.tmp" "$RULES_MD"
+  else
+    printf '\n## %s\n- %s\n' "$right" "$rule" >> "$RULES_MD"
+  fi
+  echo "cw: added under \"## $right\" in routing.md"
+}
+
+# Echo the agent's pick and give a short window to override it. A correction
+# feeds teach_route so the rules file improves over time.
+confirm_route() { # task; reads/updates ROUTED_WS
+  local task="$1" ans corrected
+  printf 'cw: routing to %s (confidence %s). Enter to accept, or type the right workspace: ' \
+    "$ROUTED_WS" "$ROUTED_CONF"
+  if read -t 8 -r ans && [[ -n "$ans" ]]; then
+    if corrected="$(resolve_ws "$ans")"; then
+      log_route corrected "$corrected" user "$task"
+      teach_route "$corrected" "$task"
+      ROUTED_WS="$corrected"
+    else
+      echo "cw: '$ans' is not a workspace, keeping $ROUTED_WS" >&2
+    fi
+  else
+    echo
+  fi
+}
+
+# ---------- tmux helpers ----------
+have_session() { tmux has-session -t "$SESSION" 2>/dev/null; }
+
+resolve_target() { # id or name fragment -> window index
+  local q="$1"
+  have_session || { echo "cw: no sessions running" >&2; exit 1; }
+  if [[ "$q" =~ ^[0-9]+$ ]]; then
+    tmux list-windows -t "$SESSION" -F '#{window_index}' | grep -qx "$q" \
+      || { echo "cw: no session with id $q" >&2; exit 1; }
+    echo "$q"; return 0
+  fi
+  local hits
+  hits="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk -v q="$q" 'index($2,q){print $1}')"
+  [[ "$(wc -l <<<"$hits" | tr -d ' ')" == "1" && -n "$hits" ]] \
+    || { echo "cw: '$q' matches $(wc -w <<<"$hits" | tr -d ' ') sessions, use an id from cw ls" >&2; exit 1; }
+  echo "$hits"
+}
+
+slugify() {
+  tr '[:upper:]' '[:lower:]' <<<"$1" | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-24 | sed -E 's/-+$//'
+}
+
+spawn() { # ws task detach(0/1)
+  local ws="$1" task="$2" detach="$3" name idx cmd ws_dir
+  name="$ws/$(slugify "$task")"
+  ws_dir="$HOME/.claude/workspaces/$ws"
+  [[ -d "$ws_dir" ]] || ws_dir="$HOME"
+  cmd="$PATH_EXPORT exec $(printf '%q' "$CLAUDE_WS") $(printf '%q' "$ws") -- $(printf '%q' "$task")"
+  if have_session; then
+    idx="$(tmux new-window -d -t "$SESSION" -n "$name" -c "$ws_dir" -P -F '#{window_index}' "$cmd")"
+  else
+    tmux new-session -d -s "$SESSION" -n "$name" -c "$ws_dir" "$cmd"
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index}' | head -1)"
+  fi
+  tmux set-option -w -t "$SESSION:$idx" remain-on-exit on
+  tmux set-option -w -t "$SESSION:$idx" automatic-rename off
+  tmux set-option -w -t "$SESSION:$idx" allow-rename off
+  tmux set-option -w -t "$SESSION:$idx" @cw_task "$task"
+  tmux set-option -w -t "$SESSION:$idx" @cw_ws "$ws"
+  tmux set-option -w -t "$SESSION:$idx" @cw_started "$(date +%s)"
+  # the home chat pane mirrors the current window, so make a fresh spawn
+  # the visible chat right away
+  if "$TMUX_BIN" -L "$HOME_SOCKET" has-session -t home 2>/dev/null; then
+    tmux select-window -t "$SESSION:$idx" 2>/dev/null || true
+  fi
+  if [[ "$detach" == "1" ]]; then
+    echo "spawned $idx  $name"
+  else
+    attach_to "$idx"
+  fi
+}
+
+attach_to() { # [index]
+  have_session || { echo "cw: no sessions running" >&2; exit 1; }
+  local idx="${1:-}"
+  [[ -n "$idx" ]] && tmux select-window -t "$SESSION:$idx"
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$SESSION"
+  else
+    exec "$TMUX_BIN" -L default attach -t "$SESSION"
+  fi
+}
+
+# busy = the model is working, input = it stopped on a question or permission
+# prompt and needs a human, idle = ready for the next prompt, done = exited.
+window_state() { # index
+  local idx="$1" cap
+  if [[ "$(tmux display -p -t "$SESSION:$idx" '#{pane_dead}')" == "1" ]]; then
+    echo done; return
+  fi
+  cap="$(tmux capture-pane -p -t "$SESSION:$idx" -S -30 2>/dev/null || true)"
+  if grep -qE 'Do you want|1\. Yes|Select workspace' <<<"$cap"; then
+    echo input; return
+  fi
+  if grep -q 'esc to interrupt' <<<"$cap"; then
+    echo busy; return
+  fi
+  # a generating session repaints its spinner constantly, an idle one is
+  # silent, so recent pane output means the model is working
+  local act
+  act="$(tmux display -p -t "$SESSION:$idx" '#{window_activity}' 2>/dev/null || echo 0)"
+  if (( $(date +%s) - act < 5 )); then
+    echo busy; return
+  fi
+  echo idle
+}
+
+rows() { # shared by ls and ui (fzf reloads call "cw __rows")
+  have_session || return 0
+  local now fmt
+  now="$(date +%s)"
+  fmt='#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{@cw_task}'
+  tmux list-windows -t "$SESSION" -F "$fmt" | while IFS='|' read -r idx ws name started task; do
+    local state age title
+    state="$(window_state "$idx")"
+    if [[ -n "$started" ]]; then
+      age=$(( (now - started) / 60 ))
+      if (( age >= 60 )); then age="$((age / 60))h"; else age="${age}m"; fi
+    else age="?"; fi
+    title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
+    printf '%-4s %-11s %-26s %-6s %-5s %s\n' "$idx" "${ws:--}" "$title" "$state" "$age" "${task:--}"
+  done
+}
+
+cmd_ls() {
+  have_session || { echo "no sessions"; exit 0; }
+  printf '%-4s %-11s %-26s %-6s %-5s %s\n' ID WS TITLE STATE AGE TASK
+  rows
+}
+
+cmd_ui() {
+  have_session || { echo "no sessions"; exit 0; }
+  command -v fzf >/dev/null 2>&1 || { echo "cw: fzf not installed (brew install fzf), showing the list instead" >&2; cmd_ls; exit 0; }
+  local me sel idx
+  me="$HOME/.claude/bin/cw"
+  sel="$(rows | fzf \
+      --header 'enter attach   ctrl-x kill   ctrl-r refresh   (busy=working, input=needs you, idle=ready, done=finished)' \
+      --preview "tmux capture-pane -p -t $SESSION:{1} | awk 'NF{f=1} f'" \
+      --preview-window 'right,58%' \
+      --bind "ctrl-r:reload($me __rows)" \
+      --bind "ctrl-x:execute-silent(tmux kill-window -t $SESSION:{1})+reload($me __rows)")" || exit 0
+  idx="$(awk '{print $1}' <<<"$sel")"
+  [[ -n "$idx" ]] && attach_to "$idx"
+}
+
+cmd_peek() {
+  local idx lines="${2:-40}"
+  idx="$(resolve_target "$1")"
+  tmux capture-pane -p -t "$SESSION:$idx" -S "-$lines"
+}
+
+cmd_send() {
+  local idx text="$2"
+  idx="$(resolve_target "$1")"
+  tmux send-keys -t "$SESSION:$idx" -l -- "$text"
+  sleep 0.4
+  tmux send-keys -t "$SESSION:$idx" Enter
+  echo "sent to $idx"
+}
+
+cmd_kill() {
+  local idx
+  idx="$(resolve_target "$1")"
+  tmux kill-window -t "$SESSION:$idx"
+  echo "killed $idx"
+  # Killing the last window kills the session, which is fine.
+}
+
+cmd_master() {
+  local idx cmd seed
+  if have_session; then
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk '$2=="master"{print $1}')"
+    if [[ -n "$idx" ]]; then attach_to "$idx"; return; fi
+  fi
+  seed="You are the cw master session. Start by running cw ls, peek anything interesting, and give a short status."
+  # The prompt goes FIRST: variadic flags like --allowedTools would swallow
+  # a trailing positional argument.
+  cmd="$PATH_EXPORT exec claude $(printf '%q' "$seed") \
+--strict-mcp-config --mcp-config=$(printf '%q' "$EMPTY_MCP") \
+--append-system-prompt \"\$(cat $(printf '%q' "$MASTER_MD"))\" \
+--allowedTools $(printf '%q' 'Bash(cw:*)') $(printf '%q' 'Bash(tmux:*)')"
+  if have_session; then
+    idx="$(tmux new-window -d -t "$SESSION" -n master -c "$HOME" -P -F '#{window_index}' "$cmd")"
+  else
+    tmux new-session -d -s "$SESSION" -n master -c "$HOME" "$cmd"
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index}' | head -1)"
+  fi
+  tmux set-option -w -t "$SESSION:$idx" remain-on-exit on
+  tmux set-option -w -t "$SESSION:$idx" automatic-rename off
+  tmux set-option -w -t "$SESSION:$idx" allow-rename off
+  tmux set-option -w -t "$SESSION:$idx" @cw_ws "-"
+  tmux set-option -w -t "$SESSION:$idx" @cw_task "orchestrate the sub sessions"
+  tmux set-option -w -t "$SESSION:$idx" @cw_started "$(date +%s)"
+  if [[ "${1:-}" == "-d" ]]; then echo "spawned $idx  master"; else attach_to "$idx"; fi
+}
+
+# ---------- the control room (cw home) ----------
+# Outer layout on its own tmux socket: list pane left (fzf over the live
+# rows), chat pane right (a second client attached to the ws server, so
+# selecting a row is one select-window call on the inner server).
+
+cmd_open() { # window index from the list, guard non numeric hint rows
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
+  tmux select-window -t "$SESSION:$1" 2>/dev/null || true
+}
+
+cmd_gomaster() {
+  local idx=""
+  if have_session; then
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk '$2=="master"{print $1}')"
+  fi
+  if [[ -z "$idx" ]]; then
+    cmd_master -d >/dev/null
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk '$2=="master"{print $1}')"
+  fi
+  [[ -n "$idx" ]] && tmux select-window -t "$SESSION:$idx"
+}
+
+cmd_guardkill() {
+  local idx="${1:-}" st
+  [[ "$idx" =~ ^[0-9]+$ ]] || return 0
+  st="$(window_state "$idx" 2>/dev/null || echo done)"
+  if [[ "$st" == "busy" ]]; then
+    "$TMUX_BIN" -L "$HOME_SOCKET" display-message "session $idx is busy, not killed" 2>/dev/null || true
+    return 0
+  fi
+  tmux kill-window -t "$SESSION:$idx" 2>/dev/null || true
+}
+
+cmd_newtask() { # runs with the list pane's tty via fzf execute
+  local t
+  printf '\nnew task (Enter to cancel): '
+  IFS= read -r t || return 0
+  [[ -n "$t" ]] || return 0
+  "$HOME/.claude/bin/cw" -d "$t" || { echo "spawn failed"; sleep 2; }
+}
+
+cmd_homerows() {
+  if ! have_session; then
+    printf -- '-  none yet: n new, m master\n'
+    return 0
+  fi
+  # compact for the narrow pane: id, workspace, title, state, age, and a
+  # star on the window the chat pane is currently showing
+  local now fmt
+  now="$(date +%s)"
+  fmt='#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{window_active}'
+  tmux list-windows -t "$SESSION" -F "$fmt" | while IFS='|' read -r idx ws name started active; do
+    local state age title mark
+    # a window can vanish between the listing and the state probe
+    state="$(window_state "$idx" 2>/dev/null || echo done)"
+    if [[ -n "$started" ]]; then
+      age=$(( (now - started) / 60 ))
+      if (( age >= 60 )); then age="$((age / 60))h"; else age="${age}m"; fi
+    else age="?"; fi
+    title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
+    mark=""; [[ "$active" == "1" ]] && mark="*"
+    printf '%-2s %-10s %-15s %-5s %-3s %s\n' "$idx" "${ws:--}" "${title:0:15}" "$state" "$age" "$mark"
+  done
+}
+
+cmd_curline() { # line number and index of the current window, for the refresher
+  have_session || return 0
+  tmux list-windows -t "$SESSION" -F '#{window_index} #{window_active}' \
+    | awk '{n++} $2==1{print n, $1}'
+}
+
+cmd_homelist() { # the left pane process
+  local me="$HOME/.claude/bin/cw" refresher
+  rm -f "$PORT_FILE"
+  (
+    # Refresh the list via fzf's listen port, but only when the rows really
+    # changed: reloads repaint the pane (flicker) and drift the cursor, so
+    # skipping no-op reloads fixes both. After every reload, snap the
+    # highlight onto the currently displayed chat (the starred row), so the
+    # highlight always shows which chat is open. The star column makes any
+    # current-window change show up in the row hash.
+    # the refresher must survive anything: one transient failure under the
+    # script's errexit killed it silently and froze the list
+    set +e +o pipefail
+    last_hash=""
+    while :; do
+      sleep 3
+      p="$(cat "$PORT_FILE" 2>/dev/null || true)"
+      [[ -n "$p" ]] || continue
+      h="$("$me" __homerows 2>/dev/null | cksum || true)"
+      [[ -n "$h" && "$h" == "$last_hash" ]] && continue
+      last_hash="$h"
+      curl -s -X POST "http://localhost:$p" \
+        -d "reload($me __homerows)" >/dev/null 2>&1 || true
+      cur="$("$me" __curline 2>/dev/null || true)"
+      if [[ -n "$cur" ]]; then
+        # after the async reload has settled (same request ordering fails)
+        sleep 0.4
+        curl -s -X POST "http://localhost:$p" \
+          -d "pos(${cur%% *})" >/dev/null 2>&1 || true
+      fi
+    done
+  ) &
+  refresher=$!
+  trap 'kill "$refresher" 2>/dev/null' EXIT
+  while :; do
+    "$me" __homerows | fzf \
+      --disabled --no-info --layout=reverse \
+      --prompt='' \
+      --header='enter open  m master  n new  x kill' \
+      --listen \
+      --bind "start:execute-silent(echo \$FZF_PORT > $PORT_FILE)" \
+      --bind "enter:execute-silent($me __open {1})" \
+      --bind "m:execute-silent($me __gomaster)+reload($me __homerows)" \
+      --bind "n:execute($me __newtask)+reload($me __homerows)" \
+      --bind "x:execute-silent($me __guardkill {1})+reload($me __homerows)" \
+      --bind 'esc:ignore' || true
+    sleep 1
+  done
+}
+
+cmd_home() {
+  local T="$TMUX_BIN" me="$HOME/.claude/bin/cw"
+  # something to look at: spawn the master if no sessions exist yet
+  have_session || cmd_master -d >/dev/null
+  if ! "$T" -L "$HOME_SOCKET" has-session -t home 2>/dev/null; then
+    "$T" -L "$HOME_SOCKET" new-session -d -s home -n main -x 220 -y 50 \
+      "$PATH_EXPORT exec $me __homelist"
+    "$T" -L "$HOME_SOCKET" set -g mouse on
+    "$T" -L "$HOME_SOCKET" set -g status off
+    "$T" -L "$HOME_SOCKET" set -g focus-events on
+    tmux set -g focus-events on 2>/dev/null || true
+    "$T" -L "$HOME_SOCKET" bind -n C-t select-pane -t :.+
+    # chat pane: a client on the inner server, reattaching if it ever drops
+    "$T" -L "$HOME_SOCKET" split-window -h -t home:0.0 -c "$HOME" \
+      "while :; do env -u TMUX $T -L default attach -t $SESSION 2>/dev/null; sleep 2; done"
+    "$T" -L "$HOME_SOCKET" resize-pane -t home:0.0 -x 44
+    # pin the list width: attaching with a different terminal size rescales
+    # panes proportionally and can crush the list to one column
+    "$T" -L "$HOME_SOCKET" set-hook -g client-attached 'resize-pane -t home:0.0 -x 44'
+    "$T" -L "$HOME_SOCKET" set-hook -g client-resized 'resize-pane -t home:0.0 -x 44'
+    "$T" -L "$HOME_SOCKET" select-pane -t home:0.0
+    # one set of chrome: the outer layout owns the screen
+    tmux set -t "$SESSION" status off 2>/dev/null || true
+  fi
+  if [[ "${1:-}" == "-d" ]]; then echo "home ready, attach with: cw home"; return 0; fi
+  exec env -u TMUX "$T" -L "$HOME_SOCKET" attach -t home
+}
+
+# ---------- CLI ----------
+detach=0
+headless=0
+
+case "${1:-}" in
+  ls|list)  cmd_ls; exit 0 ;;
+  ui)       cmd_ui; exit 0 ;;
+  __rows)   rows; exit 0 ;;
+  a|attach) shift; attach_to "$( [[ $# -ge 1 ]] && resolve_target "$1" || echo "" )"; exit 0 ;;
+  peek)     shift; [[ $# -ge 1 ]] || { echo "usage: cw peek <id> [lines]" >&2; exit 1; }
+            cmd_peek "$@"; exit 0 ;;
+  send)     shift; [[ $# -ge 2 ]] || { echo "usage: cw send <id> \"text\"" >&2; exit 1; }
+            cmd_send "$1" "$2"; exit 0 ;;
+  kill)     shift; [[ $# -ge 1 ]] || { echo "usage: cw kill <id>" >&2; exit 1; }
+            cmd_kill "$1"; exit 0 ;;
+  master)   shift || true; cmd_master "${1:-}"; exit 0 ;;
+  home)     shift || true; cmd_home "${1:-}"; exit 0 ;;
+  __homerows) cmd_homerows; exit 0 ;;
+  __homelist) cmd_homelist; exit 0 ;;
+  __open)     shift; cmd_open "${1:-}"; exit 0 ;;
+  __curline)  cmd_curline; exit 0 ;;
+  __gomaster) cmd_gomaster; exit 0 ;;
+  __guardkill) shift; cmd_guardkill "${1:-}"; exit 0 ;;
+  __newtask)  cmd_newtask; exit 0 ;;
+  route)    shift; [[ $# -ge 1 ]] || { echo "usage: cw route \"task\"" >&2; exit 1; }
+            route_decide "$*"
+            echo "workspace=$ROUTED_WS tier=$ROUTED_TIER confidence=$ROUTED_CONF"; exit 0 ;;
+  -h|--help)
+            sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "")
+            # Bare cw opens the picker when sessions exist, help otherwise.
+            if have_session; then cmd_ui; exit 0; fi
+            sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -d)       detach=1; shift ;;
+  -p)       headless=1; shift ;;
+esac
+
+[[ $# -ge 1 ]] || { echo "cw: nothing to do, try cw --help" >&2; exit 1; }
+
+# Explicit workspace as first arg?
+ws=""
+if w="$(resolve_ws "$1")"; then
+  ws="$w"; shift
+  log_route 1 "$ws" 1.0 "${*:-<none>}"
+fi
+
+if [[ $# -eq 0 ]]; then
+  # Bare "cw work": plain claude-ws in this terminal, no tmux.
+  [[ -n "$ws" ]] || { echo "cw: give me a task" >&2; exit 1; }
+  exec "$CLAUDE_WS" "$ws"
+fi
+
+task="$*"
+if [[ -z "$ws" ]]; then
+  route_decide "$task"
+  # Echo the pick and allow a quick correction, interactive spawns only.
+  if [[ "$ROUTED_TIER" == "agent" && -t 0 && -t 1 && "$headless" != "1" ]]; then
+    confirm_route "$task"
+  fi
+  ws="$ROUTED_WS"
+fi
+
+if [[ "$headless" == "1" ]]; then
+  exec "$CLAUDE_WS" "$ws" -- -p "$task"
+fi
+
+spawn "$ws" "$task" "$detach"

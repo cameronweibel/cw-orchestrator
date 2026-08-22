@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# claude-ws: launch Claude Code with a workspace profile selected.
+# Usage:
+#   claude-ws                         # interactive picker
+#   claude-ws work                    # positional
+#   claude-ws -w personal             # flag form
+#   claude-ws work -- --resume        # any extra args forward to claude
+#   claude-ws work -- -p "job"        # headless agent job
+#
+# Workspaces are discovered from $PROFILES_DIR/*.mcp.json. Adding a workspace
+# means dropping a <name>.mcp.json there plus (optionally) a CLAUDE.md and
+# workspace.env under ~/.claude/workspaces/<name>/. No script edit needed.
+set -euo pipefail
+
+PROFILES_DIR="$HOME/.claude/profiles"
+WORKSPACES_DIR="$HOME/.claude/workspaces"
+SECRETS_FILE="$HOME/.claude/secrets.env"
+
+# Load shared secrets (OAuth client id/secret etc.) if present.
+# This file is sourced as bash, so it should contain `export FOO=...` lines.
+if [[ -f "$SECRETS_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$SECRETS_FILE"
+fi
+
+# Discover workspaces from the profiles directory.
+workspaces=()
+for f in "$PROFILES_DIR"/*.mcp.json; do
+  [[ -e "$f" ]] || continue
+  b="$(basename "$f")"
+  workspaces+=("${b%.mcp.json}")
+done
+if [[ ${#workspaces[@]} -eq 0 ]]; then
+  echo "claude-ws: no profiles found in $PROFILES_DIR" >&2
+  exit 1
+fi
+
+# Resolve a name or unique prefix against the discovered workspaces.
+resolve_ws() {
+  local q="$1" hit="" w
+  for w in "${workspaces[@]}"; do
+    [[ "$w" == "$q" ]] && { echo "$w"; return 0; }
+  done
+  for w in "${workspaces[@]}"; do
+    if [[ "$w" == "$q"* ]]; then
+      if [[ -n "$hit" ]]; then
+        echo "claude-ws: '$q' is ambiguous ($hit, $w)" >&2
+        return 1
+      fi
+      hit="$w"
+    fi
+  done
+  [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+  echo "claude-ws: no workspace matching '$q'" >&2
+  echo "Available workspaces:" >&2
+  printf '  %s\n' "${workspaces[@]}" >&2
+  return 1
+}
+
+ws=""
+case "${1:-}" in
+  -w|--workspace)
+    [[ $# -ge 2 ]] || { echo "claude-ws: --workspace requires a value" >&2; exit 1; }
+    ws="$(resolve_ws "$2")"
+    shift 2
+    ;;
+  "" )
+    PS3="Select workspace: "
+    select c in "${workspaces[@]}"; do
+      [[ -n "${c:-}" ]] && { ws="$c"; break; }
+    done
+    ;;
+  *)
+    ws="$(resolve_ws "$1")"
+    shift
+    ;;
+esac
+
+profile="$PROFILES_DIR/${ws}.mcp.json"
+
+# Drop the optional `--` separator so flags after it reach claude as flags.
+if [[ "${1:-}" == "--" ]]; then shift; fi
+
+# Per-workspace home: operating folder, env, and layered context.
+ws_dir="$WORKSPACES_DIR/$ws"
+export CLAUDE_WORKSPACE="$ws"
+export CLAUDE_WORKSPACE_DIR="$ws_dir"
+
+# workspace.env pins per-workspace settings (e.g. GOOGLE_DRIVE_FOLDER_ID).
+if [[ -f "$ws_dir/workspace.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ws_dir/workspace.env"
+  set +a
+fi
+
+# The workspace CLAUDE.md layers on top of the global ~/.claude/CLAUDE.md,
+# which Claude Code loads on its own.
+extra_args=()
+if [[ -s "$ws_dir/CLAUDE.md" ]]; then
+  extra_args+=(--append-system-prompt "$(cat "$ws_dir/CLAUDE.md")")
+fi
+
+exec claude --strict-mcp-config --mcp-config "$profile" "${extra_args[@]+"${extra_args[@]}"}" "$@"

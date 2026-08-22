@@ -1,0 +1,600 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cw orchestrator design</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --card:#ffffff; --ink:#1c2330; --muted:#5b6472;
+    --line:#d7dbe2; --accent:#1c2330;
+    --personal:#2563eb; --hebbian:#356854; --convolving:#7c3aed;
+    --code-bg:#0f172a; --code-ink:#e2e8f0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+    line-height:1.55;}
+  .wrap{max-width:980px;margin:0 auto;padding:48px 28px 80px}
+  header h1{font-size:34px;margin:0 0 6px;letter-spacing:-0.5px}
+  header p.sub{color:var(--muted);font-size:17px;margin:0 0 8px;max-width:70ch}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;
+    padding:28px;margin-top:28px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  .card h2{margin:0 0 4px;font-size:21px}
+  .card p.lead{color:var(--muted);margin:0 0 18px;font-size:15px;max-width:78ch}
+  .diagram{overflow-x:auto}
+  svg{display:block;max-width:100%;height:auto}
+  svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+  code,pre{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
+  code{background:#e9ecf1;border-radius:5px;padding:1px 6px;font-size:0.88em}
+  pre{background:var(--code-bg);color:var(--code-ink);border-radius:10px;
+    padding:18px 20px;font-size:13.5px;line-height:1.65;overflow-x:auto;margin:0}
+  pre .c{color:#7d8aa0}
+  pre .g{color:#6ee7a0}
+  table{border-collapse:collapse;width:100%;font-size:14.5px}
+  th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:.4px}
+  td code{white-space:nowrap}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:14px;font-size:13.5px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+  ol.decisions{margin:10px 0 0;padding-left:22px}
+  ol.decisions li{margin-bottom:10px;max-width:80ch}
+  ol.decisions b{font-weight:650}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+  @media(max-width:760px){.cols{grid-template-columns:1fr}}
+  footer{margin-top:36px;color:var(--muted);font-size:13px}
+  .router-grid{display:grid;grid-template-columns:minmax(0,440px) 1fr;gap:26px;align-items:start}
+  @media(max-width:880px){.router-grid{grid-template-columns:1fr}}
+  .router-detail{border:1px solid var(--line);border-radius:12px;background:#f8fafc;
+    padding:20px 22px;position:sticky;top:20px;min-width:0}
+  .router-detail h3{margin:0 0 8px;font-size:16px}
+  .router-detail p{font-size:13.5px;color:var(--muted);margin:0 0 14px;line-height:1.55}
+  .router-detail pre{font-size:12.5px}
+  .dhint{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;
+    margin-bottom:14px}
+  .dpanel[hidden]{display:none}
+  svg .nodeg{cursor:pointer}
+  .tabbar{display:flex;gap:10px;margin-top:26px}
+  .tabbar button{background:#e9ecf1;color:var(--muted);border:1px solid var(--line);
+    border-radius:999px;padding:9px 20px;font-size:14px;font-weight:600;cursor:pointer;
+    font-family:inherit}
+  .tabbar button.active{background:var(--ink);color:#ffffff;border-color:var(--ink)}
+  #tab-cw[hidden],#tab-prd[hidden]{display:none}
+  .card h3{font-weight:650}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>cw, the workspace routing orchestrator</h1>
+  <p class="sub">A thin wrapper above <code>claude-ws</code>. You type a task, it decides which workspace fits, spawns a Claude session in tmux with that profile loaded, and drops you into it. <code>claude-ws</code> stays untouched.</p>
+</header>
+<nav class="tabbar">
+  <button data-tab="cw" class="active">The orchestrator</button>
+  <button data-tab="prd">cw home PRD</button>
+</nav>
+<div id="tab-cw">
+
+
+<!-- ============ DIAGRAM 1: BIG PICTURE ============ -->
+<section class="card">
+  <h2>The big picture</h2>
+  <p class="lead">One command travels down four stages. Each stage already exists except the top two.</p>
+  <div class="diagram">
+  <svg viewBox="0 0 940 760" width="940">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#8a93a2"/>
+      </marker>
+    </defs>
+
+    <!-- Stage 1: terminal input -->
+    <rect x="250" y="20" width="440" height="72" rx="10" fill="#0f172a"/>
+    <text x="270" y="50" font-size="15" fill="#6ee7a0" font-family="Menlo,monospace">$ cw "draft the SFF invoice"</text>
+    <text x="270" y="74" font-size="12.5" fill="#7d8aa0">you type a task, not a workspace</text>
+
+    <line x1="470" y1="92" x2="470" y2="132" stroke="#8a93a2" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="484" y="118" font-size="12.5" fill="#5b6472">task text plus the cwd you launched from</text>
+
+    <!-- Stage 2: router -->
+    <rect x="170" y="134" width="600" height="150" rx="12" fill="#ffffff" stroke="#1c2330" stroke-width="1.6"/>
+    <text x="194" y="163" font-size="16" font-weight="650" fill="#1c2330">cw router</text>
+    <text x="194" y="182" font-size="12.5" fill="#5b6472">two steps, detail below</text>
+    <rect x="194" y="196" width="170" height="66" rx="8" fill="#eef1f5"/>
+    <text x="209" y="222" font-size="13" font-weight="600" fill="#1c2330">1 explicit name</text>
+    <text x="209" y="241" font-size="12" fill="#5b6472">cw hebbian "..."</text>
+    <rect x="378" y="196" width="170" height="66" rx="8" fill="#eef1f5"/>
+    <text x="393" y="222" font-size="13" font-weight="600" fill="#1c2330">2 Claude agent</text>
+    <text x="393" y="241" font-size="12" fill="#5b6472">reads routing.md</text>
+    <rect x="562" y="196" width="170" height="66" rx="8" fill="#eef1f5"/>
+    <text x="577" y="222" font-size="13" font-weight="600" fill="#1c2330">unsure? asks you</text>
+    <text x="577" y="241" font-size="12" fill="#5b6472">no API key anywhere</text>
+
+    <line x1="470" y1="284" x2="470" y2="324" stroke="#8a93a2" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="484" y="310" font-size="12.5" fill="#5b6472">workspace = personal</text>
+
+    <!-- Stage 3: claude-ws -->
+    <rect x="170" y="326" width="600" height="152" rx="12" fill="#ffffff" stroke="#1c2330" stroke-width="1.6"/>
+    <text x="194" y="355" font-size="16" font-weight="650" fill="#1c2330">claude-ws personal</text>
+    <text x="194" y="374" font-size="12.5" fill="#5b6472">the existing launcher, unchanged, loads everything the workspace needs</text>
+    <rect x="194" y="390" width="256" height="30" rx="6" fill="#eef1f5"/>
+    <text x="206" y="410" font-size="12.5" fill="#1c2330">profiles/personal.mcp.json</text>
+    <rect x="462" y="390" width="270" height="30" rx="6" fill="#eef1f5"/>
+    <text x="474" y="410" font-size="12.5" fill="#1c2330">workspaces/personal/CLAUDE.md</text>
+    <rect x="194" y="428" width="256" height="30" rx="6" fill="#eef1f5"/>
+    <text x="206" y="448" font-size="12.5" fill="#1c2330">workspace.env</text>
+    <rect x="462" y="428" width="270" height="30" rx="6" fill="#eef1f5"/>
+    <text x="474" y="448" font-size="12.5" fill="#1c2330">secrets.env</text>
+
+    <line x1="470" y1="478" x2="470" y2="518" stroke="#8a93a2" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="484" y="504" font-size="12.5" fill="#5b6472">spawned as a new tmux window</text>
+
+    <!-- Stage 4: tmux -->
+    <rect x="120" y="520" width="700" height="150" rx="12" fill="#ffffff" stroke="#1c2330" stroke-width="1.6"/>
+    <text x="144" y="549" font-size="16" font-weight="650" fill="#1c2330">tmux session "ws"</text>
+    <text x="144" y="568" font-size="12.5" fill="#5b6472">one window per Claude session, tmux itself is the state</text>
+    <rect x="144" y="584" width="204" height="62" rx="8" fill="#eff4ff" stroke="#2563eb"/>
+    <text x="158" y="608" font-size="13" font-weight="600" fill="#2563eb">personal/draft-sff</text>
+    <text x="158" y="628" font-size="12" fill="#5b6472">claude running</text>
+    <rect x="360" y="584" width="204" height="62" rx="8" fill="#eef5f1" stroke="#356854"/>
+    <text x="374" y="608" font-size="13" font-weight="600" fill="#356854">hebbian/eai-pricing</text>
+    <text x="374" y="628" font-size="12" fill="#5b6472">claude running</text>
+    <rect x="576" y="584" width="204" height="62" rx="8" fill="#f4effc" stroke="#7c3aed"/>
+    <text x="590" y="608" font-size="13" font-weight="600" fill="#7c3aed">convolving/crm-touch</text>
+    <text x="590" y="628" font-size="12" fill="#5b6472">done</text>
+
+    <line x1="470" y1="670" x2="470" y2="708" stroke="#8a93a2" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="470" y="736" text-anchor="middle" font-size="13.5" fill="#1c2330" font-weight="600">you are attached and the session is already working on the task</text>
+  </svg>
+  </div>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--personal)"></span>personal, cweibelbusiness@gmail.com</span>
+    <span><span class="dot" style="background:var(--hebbian)"></span>hebbian, info@hebbian.ch</span>
+    <span><span class="dot" style="background:var(--convolving)"></span>convolving</span>
+  </div>
+</section>
+
+<!-- ============ DIAGRAM 2: ROUTER ============ -->
+<section class="card">
+  <h2>How the router decides</h2>
+  <p class="lead">Two steps. Naming the workspace yourself is a plain string match on your machine. Everything else goes to the Claude Code CLI on your normal Claude login, which decides using a rules file you write in plain language. There is no API key and no external API anywhere in this setup. Click a step in the diagram to see the file behind it on the right.</p>
+  <div class="router-grid">
+    <div class="diagram">
+    <svg viewBox="0 0 440 452" width="440">
+      <defs>
+        <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0 0 L10 5 L0 10 z" fill="#8a93a2"/>
+        </marker>
+      </defs>
+
+      <g class="nodeg" data-node="t1">
+        <rect class="nodebox" data-node="t1" x="6" y="6" width="428" height="116" rx="12" fill="#ffffff" stroke="#1c2330" stroke-width="1.5"/>
+        <text x="30" y="36" font-size="15" font-weight="650" fill="#1c2330">Step 1, explicit name</text>
+        <text x="30" y="58" font-size="12" font-weight="600" fill="#2e7d54">plain string match, no API call</text>
+        <text x="30" y="80" font-size="13" fill="#5b6472">you name the workspace as the first word</text>
+        <text x="30" y="102" font-size="12.5" fill="#5b6472" font-family="Menlo,monospace">cw heb "fix the pricing page"</text>
+      </g>
+      <line x1="220" y1="122" x2="220" y2="156" stroke="#8a93a2" stroke-width="1.6" marker-end="url(#arr3)"/>
+      <text x="232" y="144" font-size="12" fill="#5b6472">no name given</text>
+
+      <g class="nodeg" data-node="t3">
+        <rect class="nodebox" data-node="t3" x="6" y="158" width="428" height="138" rx="12" fill="#ffffff" stroke="#1c2330" stroke-width="1.5"/>
+        <text x="30" y="188" font-size="15" font-weight="650" fill="#1c2330">Step 2, the Claude agent</text>
+        <text x="30" y="210" font-size="12" font-weight="600" fill="#2e7d54">your Claude login, no API key, no external API</text>
+        <text x="30" y="232" font-size="13" fill="#5b6472">claude -p reads your plain language rules file</text>
+        <text x="30" y="252" font-size="13" fill="#5b6472">and picks the workspace</text>
+        <text x="30" y="276" font-size="12.5" fill="#5b6472" font-family="Menlo,monospace">~/.claude/orchestrator/routing.md</text>
+      </g>
+      <line x1="220" y1="296" x2="220" y2="330" stroke="#8a93a2" stroke-width="1.6" marker-end="url(#arr3)"/>
+      <text x="232" y="318" font-size="12" fill="#5b6472">confidence &lt; 0.7 or a tie</text>
+
+      <g class="nodeg" data-node="fb">
+        <rect class="nodebox" data-node="fb" x="6" y="332" width="428" height="100" rx="12" fill="#fff7ed" stroke="#d97706" stroke-width="1.5"/>
+        <text x="30" y="362" font-size="15" font-weight="650" fill="#b45309">Fallback, ask you</text>
+        <text x="30" y="386" font-size="13" fill="#7c5a2b">the picker appears with the best guess preselected</text>
+        <text x="30" y="408" font-size="13" fill="#7c5a2b">logged to routing.log like every decision</text>
+      </g>
+    </svg>
+    </div>
+
+    <div class="router-detail" id="routerDetail">
+      <div class="dhint">Click a step in the diagram to inspect it.</div>
+
+      <div class="dpanel" data-node="t1">
+        <h3>Explicit name</h3>
+        <p>No file and no call behind this step. cw compares your first word against the profile names in <code>~/.claude/profiles/</code>. Prefixes work as long as they are unambiguous.</p>
+        <pre><span class="g">$</span> cw personal "book the dentist"
+<span class="g">$</span> cw heb "fix the EAI pricing page"
+<span class="g">$</span> cw conv "log the Metellus touch"</pre>
+      </div>
+
+      <div class="dpanel" data-node="t3" hidden>
+        <h3>routing.md, the rules file</h3>
+        <p>Lives at <code>~/.claude/orchestrator/routing.md</code>. Plain language, no syntax. The agent, which is <code>claude -p</code> on your Claude Max login and nothing external, reads the whole file plus the folder you launched from before deciding. Add common requests, keywords, client and school names, and tie breakers under each workspace heading. Changes apply on the next launch. The file also grows on its own: every routed spawn echoes the pick and pauses, and if you correct it, cw asks for the general case and writes it in here for you. This is the file as it exists today, shortened.</p>
+        <pre><span class="c">## convolving</span>
+The AI consultancy. Clients, proposals,
+invoices to clients, the CRM, outreach,
+pipeline, leads, Hermes agents. Client
+names like Metellus, SWISS, Cognigy.
+
+<span class="c">## hebbian</span>
+The education company. Programmes,
+workshops, teachers, interns, schools,
+parents, the EAI course, AI Week.
+
+<span class="c">## personal</span>
+Private life. Personal finances, bills,
+the apartment, family, travel, health,
+appointments like the dentist.
+
+<span class="c">## Tie breakers</span>
+If a client is named, prefer convolving.
+School or parent contact is hebbian
+even when money is involved.</pre>
+      </div>
+
+      <div class="dpanel" data-node="fb" hidden>
+        <h3>The picker and routing.log</h3>
+        <p>Below 0.7 confidence cw asks instead of guessing, since a wrong pick means the wrong Google account. Every decision, including refusals, lands in <code>~/.claude/orchestrator/routing.log</code>. Skim it to spot repeat offenders, then add a line about them to routing.md.</p>
+        <pre>cw: not sure which workspace fits
+    (best guess: hebbian, confidence 0.65)
+1) convolving  2) hebbian  3) personal
+Select workspace:
+
+<span class="c"># routing.log</span>
+12:11  tier=agent    ws=personal  conf=0.99
+       task=book a dentist appointment
+12:11  tier=refused  ws=hebbian   conf=0.65
+       task=prepare slides for the ETH class</pre>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function(){
+      var panels = document.querySelectorAll('#routerDetail .dpanel');
+      var boxes = document.querySelectorAll('svg .nodebox');
+      function pick(k){
+        panels.forEach(function(p){ p.hidden = (p.getAttribute('data-node') !== k); });
+        boxes.forEach(function(r){
+          var sel = (r.getAttribute('data-node') === k);
+          r.setAttribute('stroke-width', sel ? '3' : '1.5');
+          if (r.getAttribute('data-node') !== 'fb') {
+            r.setAttribute('fill', sel ? '#eef4ff' : '#ffffff');
+          }
+        });
+      }
+      document.querySelectorAll('svg .nodeg').forEach(function(g){
+        g.addEventListener('click', function(){ pick(g.getAttribute('data-node')); });
+      });
+      pick('t3');
+    })();
+  </script>
+</section>
+
+<!-- ============ DIAGRAM 3: TMUX + CLI ============ -->
+<section class="card">
+  <h2>Living with the sessions</h2>
+  <p class="lead">One shared tmux session named ws holds every Claude window. Listing, attaching and killing are thin tmux calls, so there is no separate state file to drift.</p>
+  <div class="cols">
+    <div>
+      <pre><span class="c"># spawn, route, attach</span>
+<span class="g">$</span> cw "reply to the ZIS parent email"
+
+<span class="c"># spawn detached, keep your shell</span>
+<span class="g">$</span> cw -d "draft the SFF invoice"
+
+<span class="c"># skip routing, name the workspace</span>
+<span class="g">$</span> cw hebbian "fix the EAI pricing page"
+
+<span class="c"># headless, prints the result</span>
+<span class="g">$</span> cw -p "summarise unread mail"
+
+<span class="c"># manage</span>
+<span class="g">$</span> cw home
+<span class="g">$</span> cw ui
+<span class="g">$</span> cw ls
+<span class="g">$</span> cw a 2
+<span class="g">$</span> cw peek 2
+<span class="g">$</span> cw send 2 "yes, go ahead"
+<span class="g">$</span> cw kill 3
+
+<span class="c"># the orchestrator chat</span>
+<span class="g">$</span> cw master</pre>
+    </div>
+    <div>
+      <pre><span class="g">$</span> cw ls
+  1  personal/draft-sff      busy    4m
+  2  hebbian/eai-pricing     input   1m
+  3  convolving/crm-touch    done    22m
+
+<span class="c"># under the hood</span>
+tmux new-window -t ws \
+  -n "hebbian/eai-pricing" \
+  claude-ws hebbian -- "&lt;task&gt;"</pre>
+      <p style="font-size:13.5px;color:var(--muted);margin:14px 0 0">The task rides along as the first prompt, so the session starts working before you attach. Outside tmux, cw attaches. Inside tmux it switches windows instead, since nested attach fails. No tmux installed means a new iTerm tab via osascript, same routing.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FILES ============ -->
+<section class="card">
+  <h2>What gets created</h2>
+  <table>
+    <tr><th>Path</th><th>Role</th></tr>
+    <tr><td><code>~/.claude/bin/cw</code></td><td>the orchestrator, one bash script around 180 lines</td></tr>
+    <tr><td><code>~/.claude/orchestrator/routing.md</code></td><td>plain language routing rules the agent reads, yours to grow</td></tr>
+    <tr><td><code>~/.claude/orchestrator/routing.log</code></td><td>decision log for tuning the rules</td></tr>
+    <tr><td><code>~/.claude/workspaces.json</code></td><td>gains a one line description per workspace, feeds the classifier</td></tr>
+  </table>
+  <p style="font-size:13.5px;color:var(--muted);margin:16px 0 0">Nothing else changes. Discovery, secrets, CLAUDE.md layering and workspace.env keep living in claude-ws, and Hermes plus ws-sweep keep calling it directly.</p>
+</section>
+
+<!-- ============ USAGE GUIDE ============ -->
+<section class="card">
+  <h2>How to use it</h2>
+  <p class="lead">Everything below is real output from the live test runs. All of this is installed and working.</p>
+
+  <h3 style="font-size:16px;margin:18px 0 8px">1. Start something</h3>
+  <p style="font-size:14.5px;color:var(--muted);margin:0 0 10px;max-width:80ch">Type a task in any terminal. cw picks the workspace, spawns the session in tmux, and attaches you. You land in a normal Claude Code session already working on the task, with the right profile loaded (check the [PERS], [HEBB] or [CONV] tag in the statusline). Detach with ctrl+b d and it keeps working.</p>
+  <pre><span class="g">$</span> cw "reply to the ZIS parent email about the schedule"
+
+<span class="c"># stay in your shell instead</span>
+<span class="g">$</span> cw -d "book a dentist appointment for me next week"
+spawned 0  personal/book-a-dentist-appointm
+
+<span class="c"># name the workspace yourself, routing skipped</span>
+<span class="g">$</span> cw heb "fix the EAI pricing page"
+
+<span class="c"># the agent echoes its pick and pauses 8 seconds.</span>
+<span class="c"># Enter or waiting accepts, typing a workspace corrects it,</span>
+<span class="c"># and a correction teaches routing.md a new rule by itself</span>
+cw: routing to personal (confidence 0.95). Enter to accept,
+    or type the right workspace: hebbian
+cw: what is the general rule? (one sentence, Enter to skip)
+&gt; haircuts during school visits are hebbian
+cw: added under "## hebbian" in routing.md
+
+<span class="c"># when cw is unsure it asks instead of guessing</span>
+cw: not sure which workspace fits (best guess: hebbian, confidence 0.65).
+1) convolving  2) hebbian  3) personal
+Select workspace:</pre>
+
+  <h3 style="font-size:16px;margin:22px 0 8px">2. See what's running</h3>
+  <p style="font-size:14.5px;color:var(--muted);margin:0 0 10px;max-width:80ch">cw ui (or bare cw once sessions exist) opens an arrow key picker over the live list, with each session's actual screen previewed on the right. Enter jumps into the highlighted session and you take it over as a normal Claude Code terminal, ctrl+b d hops back out, ctrl-x kills a session, ctrl-r refreshes. cw ls prints the same list without the interface. Four states: busy means the model is working, input means it stopped on a question and needs you, idle means it is ready for a prompt, done means it finished.</p>
+  <pre><span class="g">$</span> cw ui
+  0    personal    dentist-appointment    idle   4m   │ Claude: I found two slots,
+  1    hebbian     eai-pricing            busy   1m   │ Tuesday 9:00 or Thursday
+  2    convolving  crm-touch-sweep        input  8m   │ 14:00. Which one?
+  3    -           master                 idle   2m   │
+  enter attach   ctrl-x kill   ctrl-r refresh        │ (preview of highlighted
+&gt;                                                    │  session's screen)
+
+<span class="g">$</span> cw ls
+ID   WS          TITLE                      STATE  AGE   TASK
+0    personal    dentist-appointment        idle   4m    book a dentist appointment
+1    hebbian     eai-pricing                busy   1m    fix the EAI pricing page
+2    convolving  crm-touch-sweep            input  8m    log the Metellus call touch
+3    -           master                     idle   2m    orchestrate the sub sessions</pre>
+
+  <h3 style="font-size:16px;margin:22px 0 8px">3. Look inside and talk to a session</h3>
+  <p style="font-size:14.5px;color:var(--muted);margin:0 0 10px;max-width:80ch">peek shows a session's screen, send types into it and presses Enter. This is how you answer a question a background session is stuck on without attaching. Jump in fully with cw a 0, close with cw kill 0.</p>
+  <pre><span class="g">$</span> cw peek 0
+&gt; book a dentist appointment for me next week
+Claude: I found two slots, Tuesday 9:00 or Thursday 14:00. Which one?
+
+<span class="g">$</span> cw send 0 "Thursday 14:00"
+sent to 0</pre>
+
+  <h3 style="font-size:16px;margin:22px 0 8px">4. The master chat</h3>
+  <p style="font-size:14.5px;color:var(--muted);margin:0 0 10px;max-width:80ch">cw master opens the orchestrator session. It has no email or Drive access, just preapproved cw and tmux commands, and it starts by sweeping the list. Talk to it in plain language and it drives the sub chats. Proven in testing: "what's everyone doing", "tell session 0 to also check the Friday slots", "spawn a session to draft the SFF invoice", "clean up the done sessions". It peeks before and after every send to confirm the instruction landed, and never kills anything you did not ask it to.</p>
+  <pre><span class="g">$</span> cw master
+
+Claude: Status, two sessions up.
+
+  Session 0 (personal) is a test session. It replied READY, answered
+  a PONG check, and is now idle waiting for instructions.
+  Session 1 is this master session.
+
+  Nothing is blocked or asking questions. Ready for tasks.</pre>
+
+  <h3 style="font-size:16px;margin:22px 0 8px">5. Utilities</h3>
+  <p style="font-size:14.5px;color:var(--muted);margin:0 0 10px;max-width:80ch">When routing gets something wrong, add a plain sentence about it under the right workspace heading in routing.md and the agent uses it on the next launch.</p>
+  <pre><span class="c"># dry run, spawns nothing</span>
+<span class="g">$</span> cw route "log the touch for the Metellus call"
+workspace=convolving tier=agent confidence=0.98
+
+<span class="c"># headless, prints the answer and exits</span>
+<span class="g">$</span> cw -p "summarise my unread mail"
+
+<span class="c"># every routing decision</span>
+<span class="g">$</span> tail ~/.claude/orchestrator/routing.log
+
+<span class="c"># teach the router, in ~/.claude/orchestrator/routing.md</span>
+<span class="c">## personal</span>
+... appointments like the dentist or the doctor ...</pre>
+</section>
+
+<!-- ============ DECISIONS ============ -->
+<section class="card">
+  <h2>Decisions baked in</h2>
+  <ol class="decisions">
+    <li><b>Wrapper, not a rewrite.</b> cw shells out to claude-ws so both entry points keep working and Hermes is unaffected.</li>
+    <li><b>tmux over background processes.</b> Attach, scrollback and visible permission prompts come free. A detached session that hits a permission question just waits until you attach, and cw ls surfaces it.</li>
+    <li><b>Ask on low confidence.</b> Never default to a workspace when unsure. An account mixup costs more than the picker.</li>
+    <li><b>One task per session.</b> A cross workspace task spawns into the primary workspace. A --multi flag can come later.</li>
+  </ol>
+</section>
+
+</div>
+
+<div id="tab-prd" hidden>
+
+<section class="card">
+  <h2>cw home, the control room</h2>
+  <p class="lead">PRD for a light utility on top of cw. Status: BUILT and tested, 21 Aug 2026 (M1 core plus the M2 keys). Run cw home to use it. Decisions locked with Cameron: side pane list, up and down arrow keys, always on from first use.</p>
+  <p style="font-size:14.5px;max-width:80ch;color:var(--muted)">Today each cw session lives in its own tmux window and you hop between them with cw ui or cw a. That works for dipping in, but there is no place to sit. cw home is that place: one always running screen with the master chat and every sub chat in a permanent list on the left, and whichever chat you highlight filling the rest of the screen as a normal Claude Code terminal. You leave it open on a monitor or reattach to it whenever you want; nothing dies when the terminal window closes.</p>
+  <div class="cols" style="margin-top:18px">
+    <div>
+      <h3 style="font-size:15px;margin:0 0 8px">Goals</h3>
+      <ul style="font-size:14px;color:var(--muted);margin:0;padding-left:20px;line-height:1.7">
+        <li>One command, cw home, opens or reattaches the control room</li>
+        <li>Always visible list: master plus every sub session with live state</li>
+        <li>Up and down arrows move the highlight, Enter swaps the chat in</li>
+        <li>The open chat is a real Claude Code terminal, typing just works</li>
+        <li>A chat waiting on you (input state) is visible at a glance</li>
+        <li>Survives closing the terminal window, reattach any time</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="font-size:15px;margin:0 0 8px">Non goals</h3>
+      <ul style="font-size:14px;color:var(--muted);margin:0;padding-left:20px;line-height:1.7">
+        <li>No new daemon and no autostart at login, first use starts it</li>
+        <li>No API calls, everything is tmux and the existing cw script</li>
+        <li>No replacement of cw ui, the popup picker stays for quick hops</li>
+        <li>No web UI, this is a terminal utility</li>
+        <li>No change to how sessions spawn, route, or store state</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>What it looks like</h2>
+  <p class="lead">Two panes in one terminal window. The list pane owns the arrow keys when focused; inside the chat the arrows behave normally, so one hop key (and the mouse) moves focus between the two.</p>
+  <pre>┌─ SESSIONS ─────────┬──────────────────────────────────────────────────┐
+│                    │                                                  │
+│ > master     idle  │   [the highlighted chat fills this pane:         │
+│   0 personal idle  │    a normal, fully interactive Claude Code       │
+│     4m             │    session you type into directly]               │
+│   1 hebbian  busy  │                                                  │
+│     1m             │                                                  │
+│   2 convolv. INPUT │                                                  │
+│     needs you  8m  │                                                  │
+│                    │                                                  │
+│────────────────────│                                                  │
+│ arrows move        │                                                  │
+│ enter open  m mstr │                                                  │
+│ n new task  x kill │                                                  │
+└────────────────────┴──────────────────────────────────────────────────┘</pre>
+  <table style="margin-top:20px">
+    <tr><th>Key</th><th>Where</th><th>Action</th></tr>
+    <tr><td><code>Up</code> / <code>Down</code></td><td>list</td><td>move the highlight through master and the sub chats</td></tr>
+    <tr><td><code>Enter</code></td><td>list</td><td>open the highlighted chat in the right pane, focus stays on the list</td></tr>
+    <tr><td><code>ctrl+t</code></td><td>anywhere</td><td>hop focus between list and chat (configurable, picked to avoid Claude Code keys)</td></tr>
+    <tr><td>mouse click</td><td>anywhere</td><td>focus a pane or a list row directly</td></tr>
+    <tr><td><code>m</code></td><td>list</td><td>jump straight to the master chat</td></tr>
+    <tr><td><code>n</code></td><td>list</td><td>type a new task, routed and spawned like cw -d</td></tr>
+    <tr><td><code>x</code></td><td>list</td><td>kill the highlighted session, guarded while it is busy</td></tr>
+  </table>
+  <p style="font-size:14px;color:var(--muted);margin:16px 0 0;max-width:80ch">States reuse the four from cw ls. busy means the model is working, idle means ready, done means finished. input renders as the attention state: the row is highlighted so a sub chat stuck on a question pulls your eye even while you type in another chat.</p>
+</section>
+
+<section class="card">
+  <h2>How it works</h2>
+  <p class="lead">The nested client pattern. Nothing new runs in the background; the outer layout lives on its own tmux socket and the right pane is a second client attached to the existing ws server.</p>
+  <div class="diagram">
+  <svg viewBox="0 0 940 440" width="940">
+    <defs>
+      <marker id="arrp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0 0 L10 5 L0 10 z" fill="#8a93a2"/>
+      </marker>
+    </defs>
+    <rect x="10" y="16" width="580" height="330" rx="14" fill="#ffffff" stroke="#1c2330" stroke-width="1.6"/>
+    <text x="34" y="46" font-size="15" font-weight="650" fill="#1c2330">your terminal: cw home</text>
+    <text x="34" y="66" font-size="12.5" fill="#5b6472">outer tmux session "home" on its own socket (tmux -L cwhome)</text>
+
+    <rect x="34" y="86" width="180" height="238" rx="10" fill="#f4f6f9" stroke="#5b6472"/>
+    <text x="52" y="114" font-size="13.5" font-weight="650" fill="#1c2330">list pane</text>
+    <text x="52" y="138" font-size="12" fill="#5b6472">fzf over cw __rows</text>
+    <text x="52" y="158" font-size="12" fill="#5b6472">arrows and Enter</text>
+    <text x="52" y="178" font-size="12" fill="#5b6472">states via</text>
+    <text x="52" y="196" font-size="12" fill="#5b6472">window_state</text>
+    <text x="52" y="216" font-size="12" fill="#5b6472">refreshes every 3s</text>
+    <text x="52" y="236" font-size="12" fill="#5b6472">(fzf listen port)</text>
+
+    <rect x="234" y="86" width="332" height="238" rx="10" fill="#f4f6f9" stroke="#5b6472"/>
+    <text x="252" y="114" font-size="13.5" font-weight="650" fill="#1c2330">chat pane</text>
+    <text x="252" y="138" font-size="12" fill="#5b6472">a second tmux client:</text>
+    <text x="252" y="158" font-size="12" fill="#5b6472" font-family="Menlo,monospace">env -u TMUX tmux attach -t ws</text>
+    <text x="252" y="182" font-size="12" fill="#5b6472">always shows the ws server's current</text>
+    <text x="252" y="200" font-size="12" fill="#5b6472">window, so it repaints the moment</text>
+    <text x="252" y="218" font-size="12" fill="#5b6472">the selection changes</text>
+
+    <rect x="650" y="46" width="270" height="300" rx="14" fill="#ffffff" stroke="#1c2330" stroke-width="1.6"/>
+    <text x="674" y="76" font-size="15" font-weight="650" fill="#1c2330">existing ws server</text>
+    <text x="674" y="96" font-size="12.5" fill="#5b6472">untouched, cw stays the engine</text>
+    <rect x="674" y="112" width="222" height="40" rx="8" fill="#eef1f5"/>
+    <text x="690" y="137" font-size="12.5" fill="#1c2330">master</text>
+    <rect x="674" y="160" width="222" height="40" rx="8" fill="#eff4ff" stroke="#2563eb"/>
+    <text x="690" y="185" font-size="12.5" fill="#2563eb">0 personal/draft-sff</text>
+    <rect x="674" y="208" width="222" height="40" rx="8" fill="#eef5f1" stroke="#356854"/>
+    <text x="690" y="233" font-size="12.5" fill="#356854">1 hebbian/eai-pricing</text>
+    <rect x="674" y="256" width="222" height="40" rx="8" fill="#f4effc" stroke="#7c3aed"/>
+    <text x="690" y="281" font-size="12.5" fill="#7c3aed">2 convolving/crm-touch</text>
+
+    <line x1="124" y1="324" x2="124" y2="386" stroke="#8a93a2" stroke-width="1.6"/>
+    <line x1="124" y1="386" x2="784" y2="386" stroke="#8a93a2" stroke-width="1.6"/>
+    <line x1="784" y1="386" x2="784" y2="352" stroke="#8a93a2" stroke-width="1.6" marker-end="url(#arrp)"/>
+    <text x="240" y="378" font-size="12.5" fill="#5b6472">Enter runs: tmux select-window -t ws:N on the inner server</text>
+
+    <line x1="650" y1="196" x2="572" y2="196" stroke="#2e9e6b" stroke-width="1.8" marker-end="url(#arrp)"/>
+    <text x="586" y="182" font-size="12" fill="#2e9e6b" font-weight="600" text-anchor="end">current window</text>
+    <text x="586" y="216" font-size="12" fill="#2e9e6b" font-weight="600" text-anchor="end">streams in</text>
+  </svg>
+  </div>
+  <p style="font-size:14px;color:var(--muted);margin:14px 0 0;max-width:82ch">Everything reuses what cw already has: the row builder (cw __rows), the state detector (window_state), fzf, and the spawn and kill paths. Always on falls out for free, both tmux servers keep running after you close the terminal, and cw home reattaches to the same layout.</p>
+</section>
+
+<section class="card">
+  <h2>Tradeoffs and edge cases</h2>
+  <table>
+    <tr><th>Case</th><th>Behavior</th></tr>
+    <tr><td>tmux prefix inside the chat</td><td>the chat is a nested client, so reaching the inner server by hand needs the prefix twice. Rarely needed, cw commands cover the common actions.</td></tr>
+    <tr><td>double status bars</td><td>while a home client is attached, the inner ws session's status bar is switched off so only the outer layout draws chrome.</td></tr>
+    <tr><td>no sessions yet</td><td>the list shows an empty state with the hint "type n to start a task, m to open the master".</td></tr>
+    <tr><td>terminal resize</td><td>the list pane keeps a fixed width around 26 columns, the chat pane absorbs the rest.</td></tr>
+    <tr><td>done rows</td><td>finished sessions stay listed and dimmed until killed with x, same as cw ls today.</td></tr>
+    <tr><td>arrow keys in the chat</td><td>untouched. The list only owns the arrows while it has focus, which is why the hop key exists.</td></tr>
+  </table>
+</section>
+
+<section class="card">
+  <h2>Milestones and success</h2>
+  <ol class="decisions">
+    <li><b>M1, the core.</b> cw home builds the layout, list with live states, arrows plus Enter switching, hop key, mouse focus, auto refresh.</li>
+    <li><b>M2, attention and actions.</b> input rows highlighted, n to spawn a routed task, x to kill with the busy guard, m for master.</li>
+    <li><b>M3, polish.</b> Resize behavior, empty state, reattach smoke test, docs on this page move from PRD to usage.</li>
+  </ol>
+  <p style="font-size:14px;color:var(--muted);margin:12px 0 0;max-width:80ch">Done means: open a terminal, run cw home, move the highlight with the arrows and press Enter, and the chat swaps in fast. A sub chat that stops on a question shows as needs you within a few seconds. Close the terminal, reopen, cw home puts you back exactly where you were.</p>
+</section>
+
+</div>
+
+<script>
+  (function(){
+    function showTab(k){
+      document.getElementById('tab-cw').hidden = (k !== 'cw');
+      document.getElementById('tab-prd').hidden = (k !== 'prd');
+      document.querySelectorAll('.tabbar button').forEach(function(b){
+        b.classList.toggle('active', b.getAttribute('data-tab') === k);
+      });
+      if (history.replaceState) history.replaceState(null, '', k === 'prd' ? '#prd' : location.pathname);
+      window.scrollTo(0, 0);
+    }
+    document.querySelectorAll('.tabbar button').forEach(function(b){
+      b.addEventListener('click', function(){ showTab(b.getAttribute('data-tab')); });
+    });
+    window.addEventListener('hashchange', function(){
+      showTab(location.hash === '#prd' ? 'prd' : 'cw');
+    });
+    showTab(location.hash === '#prd' ? 'prd' : 'cw');
+  })();
+</script>
+
+<footer>cw orchestrator design, updated 21 Aug 2026</footer>
+
+</div>
+</body>
+</html>

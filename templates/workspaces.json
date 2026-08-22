@@ -1,0 +1,14 @@
+{
+  "workspaces": [
+    {
+      "name": "work",
+      "display_name": "Work",
+      "description": "Your company or client work. Clients, projects, proposals, invoices, outreach. List the words and names that mean work."
+    },
+    {
+      "name": "personal",
+      "display_name": "Personal",
+      "description": "Private life. Personal finances, bills, family, home admin, travel, health, appointments."
+    }
+  ]
+}
