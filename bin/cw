@@ -272,12 +272,19 @@ mark_selected() { # index; stamp the selection so window_state ignores the repai
   tmux set-option -w -t "$SESSION:$1" @cw_seltime "$(date +%s)" 2>/dev/null || true
 }
 
+# Reorder a piped window listing (fields split on |, name in field 3) so the
+# master row always comes first; the rest keep their window index order.
+pin_master() {
+  awk -F'|' '$3=="master"{m=$0; next} {rest[++n]=$0}
+    END{if(m) print m; for(i=1;i<=n;i++) print rest[i]}'
+}
+
 rows() { # shared by ls and ui (fzf reloads call "cw __rows")
   have_session || return 0
   local now fmt
   now="$(date +%s)"
   fmt='#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{@cw_task}'
-  tmux list-windows -t "$SESSION" -F "$fmt" | while IFS='|' read -r idx ws name started task; do
+  tmux list-windows -t "$SESSION" -F "$fmt" | pin_master | while IFS='|' read -r idx ws name started task; do
     local state age title
     state="$(window_state "$idx")"
     if [[ -n "$started" ]]; then
@@ -413,7 +420,7 @@ cmd_homerows() {
   local now fmt
   now="$(date +%s)"
   fmt='#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{window_active}'
-  tmux list-windows -t "$SESSION" -F "$fmt" | while IFS='|' read -r idx ws name started active; do
+  tmux list-windows -t "$SESSION" -F "$fmt" | pin_master | while IFS='|' read -r idx ws name started active; do
     local state age title mark
     # a window can vanish between the listing and the state probe
     state="$(window_state "$idx" 2>/dev/null || echo done)"
