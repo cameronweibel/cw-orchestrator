@@ -204,6 +204,7 @@ spawn() { # ws task detach(0/1)
   # the visible chat right away
   if "$TMUX_BIN" -L "$HOME_SOCKET" has-session -t home 2>/dev/null; then
     tmux select-window -t "$SESSION:$idx" 2>/dev/null || true
+    mark_selected "$idx"
   fi
   if [[ "$detach" == "1" ]]; then
     echo "spawned $idx  $name"
@@ -215,7 +216,7 @@ spawn() { # ws task detach(0/1)
 attach_to() { # [index]
   have_session || { echo "cw: no sessions running" >&2; exit 1; }
   local idx="${1:-}"
-  [[ -n "$idx" ]] && tmux select-window -t "$SESSION:$idx"
+  [[ -n "$idx" ]] && { tmux select-window -t "$SESSION:$idx"; mark_selected "$idx"; }
   if [[ -n "${TMUX:-}" ]]; then
     tmux switch-client -t "$SESSION"
   else
@@ -250,13 +251,25 @@ window_state() { # index
     echo busy; return
   fi
   # a generating session repaints its spinner constantly, an idle one is
-  # silent, so recent pane output means the model is working
-  local act
+  # silent, so recent pane output means the model is working. But selecting
+  # a window also produces output (focus-events makes the TUI repaint), so
+  # right after a selection this heuristic would show a false busy for one
+  # refresh. @cw_seltime is stamped on every selection; skip the heuristic
+  # inside its grace window. The esc-to-interrupt check above still catches
+  # a session that is working.
+  local act sel
   act="$(tmux display -p -t "$SESSION:$idx" '#{window_activity}' 2>/dev/null || echo 0)"
-  if (( $(date +%s) - act < 5 )); then
+  sel="$(tmux display -p -t "$SESSION:$idx" '#{@cw_seltime}' 2>/dev/null || echo 0)"
+  sel="${sel:-0}"
+  local now; now="$(date +%s)"
+  if (( now - act < 5 )) && (( now - sel >= 8 )); then
     echo busy; return
   fi
   echo idle
+}
+
+mark_selected() { # index; stamp the selection so window_state ignores the repaint
+  tmux set-option -w -t "$SESSION:$1" @cw_seltime "$(date +%s)" 2>/dev/null || true
 }
 
 rows() { # shared by ls and ui (fzf reloads call "cw __rows")
@@ -356,6 +369,7 @@ cmd_master() {
 cmd_open() { # window index from the list, guard non numeric hint rows
   [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
   tmux select-window -t "$SESSION:$1" 2>/dev/null || true
+  mark_selected "$1"
 }
 
 cmd_gomaster() {
@@ -367,7 +381,7 @@ cmd_gomaster() {
     cmd_master -d >/dev/null
     idx="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk '$2=="master"{print $1}')"
   fi
-  [[ -n "$idx" ]] && tmux select-window -t "$SESSION:$idx"
+  [[ -n "$idx" ]] && { tmux select-window -t "$SESSION:$idx"; mark_selected "$idx"; }
 }
 
 cmd_guardkill() {
