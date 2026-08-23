@@ -365,6 +365,16 @@ cmd_master() {
   tmux set-option -w -t "$SESSION:$idx" @cw_ws "-"
   tmux set-option -w -t "$SESSION:$idx" @cw_task "orchestrate the sub sessions"
   tmux set-option -w -t "$SESSION:$idx" @cw_started "$(date +%s)"
+  # master owns window 0: swap with whatever sits there, or move into the
+  # free slot (window options travel with the window either way)
+  if [[ "$idx" != "0" ]]; then
+    if tmux list-windows -t "$SESSION" -F '#{window_index}' | grep -qx 0; then
+      tmux swap-window -d -s "$SESSION:$idx" -t "$SESSION:0"
+    else
+      tmux move-window -d -s "$SESSION:$idx" -t "$SESSION:0"
+    fi
+    idx=0
+  fi
   if [[ "${1:-}" == "-d" ]]; then echo "spawned $idx  master"; else attach_to "$idx"; fi
 }
 
