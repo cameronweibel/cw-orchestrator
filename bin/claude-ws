@@ -2,10 +2,10 @@
 # claude-ws: launch Claude Code with a workspace profile selected.
 # Usage:
 #   claude-ws                         # interactive picker
-#   claude-ws work                    # positional
-#   claude-ws -w personal             # flag form
-#   claude-ws work -- --resume        # any extra args forward to claude
-#   claude-ws work -- -p "job"        # headless agent job
+#   claude-ws hebbian                 # positional
+#   claude-ws -w convolving           # flag form
+#   claude-ws hebbian -- --resume     # any extra args forward to claude
+#   claude-ws hebbian -- -p "job"     # headless agent job (Hermes uses this form)
 #
 # Workspaces are discovered from $PROFILES_DIR/*.mcp.json. Adding a workspace
 # means dropping a <name>.mcp.json there plus (optionally) a CLAUDE.md and

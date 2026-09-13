@@ -1,0 +1,977 @@
+#!/usr/bin/env bash
+# codexw: workspace routing orchestrator above codex-ws.
+#
+#   codexw "task"             route to a workspace, spawn in tmux, attach
+#   codexw -d "task"          same but stay detached
+#   codexw <ws> "task"        explicit workspace, skip routing
+#   codexw -p "task"          route, run headless (codex exec), print result
+#   codexw ls                 list all spawned sessions
+#   codexw ui                 arrow key picker with live preview, Enter attaches
+#   codexw a [id]             attach (to a specific session, or the ws session)
+#   codexw peek <id> [lines]  show the last lines of a session's screen
+#   codexw send <id> "text"   type into a session and press Enter
+#   codexw kill <id>          close a session window
+#   codexw route "task"       dry run, print the routing decision
+#   codexw master             spawn or attach the master orchestrator session
+#   codexw home               the control room: session list left, chat right
+#
+# The Codex twin of cw. Sessions live as windows of the tmux session "cws",
+# so codexw and cw never see or touch each other's sessions. Routing rules
+# are shared: both read ~/.claude/orchestrator/routing.md.
+
+set -euo pipefail
+
+PROFILES_DIR="$HOME/.claude/profiles"
+ORC_DIR="$HOME/.claude/orchestrator"
+RULES_MD="$ORC_DIR/routing.md"
+RLOG="$ORC_DIR/codex-routing.log"
+EMPTY_MCP="$ORC_DIR/empty.mcp.json"
+MASTER_MD="$ORC_DIR/codex-master.md"
+MASTER_WS_DIR="$ORC_DIR/codex-master"
+CODEX_HOMES_DIR="$HOME/.codex-ws"
+BUILDER="$HOME/.claude/bin/codex-ws-profile.py"
+REGISTRY="$HOME/.claude/workspaces.json"
+CODEX_WS="$HOME/.claude/bin/codex-ws"
+SESSION="cws"
+CONF_MIN="0.7"
+ROUTER_MODEL="gpt-5.4-mini"
+PATH_EXPORT="export PATH=\"$HOME/.claude/bin:/opt/homebrew/bin:$HOME/.local/bin:\$PATH\";"
+HOME_SOCKET="cxwhome"
+PORT_FILE="$ORC_DIR/.codex_home_port"
+ANCHOR_FILE="$ORC_DIR/.codex_home_anchor"
+ORDER_FILE="$ORC_DIR/.codex_home_order"
+RELOAD_LOCK="$ORC_DIR/.codex_home_reloading"
+# Home list refresh cadence. The refresher recomputes the rows every
+# HOME_POLL seconds and only pushes a reload when they changed. The age
+# column is left out of that comparison (it ticks on its own), so a separate
+# HOME_AGE_TICK forces one reload a minute to keep the ages honest. ctrl-r
+# in the list forces a reload right away.
+HOME_POLL=12
+HOME_AGE_TICK=60
+TMUX_BIN="$(command -v tmux)"
+
+# Codex ships inside the ChatGPT desktop app, so it is often not on PATH.
+find_codex() {
+  if [[ -n "${CODEX_BIN:-}" ]]; then echo "$CODEX_BIN"; return 0; fi
+  if command -v codex >/dev/null 2>&1; then command -v codex; return 0; fi
+  local bundled="/Applications/ChatGPT.app/Contents/Resources/codex"
+  [[ -x "$bundled" ]] && { echo "$bundled"; return 0; }
+  echo "codexw: no codex binary found, set CODEX_BIN" >&2
+  return 1
+}
+CODEX_BIN_PATH="$(find_codex)"
+
+# Every codexw tmux call targets the default server explicitly. Without this,
+# running codexw from inside the codexw home outer session (its own socket) would
+# talk to the wrong server via $TMUX.
+tmux() { "$TMUX_BIN" -L default "$@"; }
+
+# ---------- workspace discovery ----------
+workspaces=()
+for f in "$PROFILES_DIR"/*.mcp.json; do
+  [[ -e "$f" ]] || continue
+  b="$(basename "$f")"
+  workspaces+=("${b%.mcp.json}")
+done
+[[ ${#workspaces[@]} -gt 0 ]] || { echo "codexw: no profiles in $PROFILES_DIR" >&2; exit 1; }
+
+resolve_ws() {
+  local q="$1" hit="" w
+  for w in "${workspaces[@]}"; do
+    [[ "$w" == "$q" ]] && { echo "$w"; return 0; }
+  done
+  for w in "${workspaces[@]}"; do
+    if [[ "$w" == "$q"* ]]; then
+      [[ -n "$hit" ]] && return 1
+      hit="$w"
+    fi
+  done
+  [[ -n "$hit" ]] && { echo "$hit"; return 0; }
+  return 1
+}
+
+# ---------- routing ----------
+log_route() { # tier ws conf task
+  printf '%s\ttier=%s\tws=%s\tconf=%s\ttask=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" "$3" "$4" >> "$RLOG"
+}
+
+# A CODEX_HOME with nothing in it but a login and a model. Building one keeps
+# the router turn from starting the workspace MCP servers or the plugins.
+router_home() {
+  local home="$CODEX_HOMES_DIR/router"
+  mkdir -p "$home"
+  ln -sfn "$HOME/.codex/auth.json" "$home/auth.json"
+  cat > "$home/config.toml" <<TOML
+model = "$ROUTER_MODEL"
+model_reasoning_effort = "low"
+
+[projects."$home"]
+trust_level = "trusted"
+TOML
+  cat > "$home/route.schema.json" <<'JSON'
+{
+  "type": "object",
+  "properties": {
+    "workspace": { "type": "string" },
+    "confidence": { "type": "number" }
+  },
+  "required": ["workspace", "confidence"],
+  "additionalProperties": false
+}
+JSON
+  echo "$home"
+}
+
+route_llm() { # task -> prints "workspace confidence" on success
+  local task="$1" rules prompt out json ws conf
+  if [[ -s "$RULES_MD" ]]; then
+    rules="$(cat "$RULES_MD")"
+  else
+    rules="$(jq -r '.workspaces[] | "- \(.name): \(.description // .notes // "no description")"' "$REGISTRY" 2>/dev/null \
+      || printf -- '- %s\n' "${workspaces[@]}")"
+  fi
+  prompt="You route tasks to one of these workspaces: ${workspaces[*]}.
+
+Routing rules:
+$rules
+
+The task was launched from the folder: $PWD
+
+Task: \"$task\"
+
+Reply with ONLY a JSON object, no other text: {\"workspace\":\"<name>\",\"confidence\":<number 0 to 1>}"
+  # Routing is one short classification, so it runs on the small model with
+  # no plugins, no MCP servers and no instructions loaded. router_home is a
+  # bare CODEX_HOME built for exactly that. The output schema forces a clean
+  # JSON object, and --output-last-message keeps the banner and the echoed
+  # prompt (which contains a JSON example of its own) out of the parse.
+  local home msg
+  home="$(router_home)"
+  msg="$(mktemp -t codexw-route)"
+  CODEX_HOME="$home" "$CODEX_BIN_PATH" exec --skip-git-repo-check \
+    --sandbox read-only -m "$ROUTER_MODEL" -C "$home" \
+    --output-schema "$home/route.schema.json" --output-last-message "$msg" \
+    "$prompt" </dev/null >/dev/null 2>&1 || { rm -f "$msg"; return 1; }
+  out="$(cat "$msg")"; rm -f "$msg"
+  json="$(grep -o '{[^}]*}' <<<"$out" | head -1)"
+  ws="$(jq -r '.workspace // empty' <<<"$json" 2>/dev/null)"
+  conf="$(jq -r '.confidence // 0' <<<"$json" 2>/dev/null)"
+  ws="$(resolve_ws "$ws")" || return 1
+  echo "$ws $conf"
+}
+
+# Sets ROUTED_WS, ROUTED_TIER, ROUTED_CONF or exits.
+route_decide() {
+  local task="$1" ws conf pair
+  if pair="$(route_llm "$task")"; then
+    ws="${pair%% *}"; conf="${pair##* }"
+    if awk -v c="$conf" -v m="$CONF_MIN" 'BEGIN{exit !(c>=m)}'; then
+      ROUTED_WS="$ws"; ROUTED_TIER="agent"; ROUTED_CONF="$conf"
+      log_route agent "$ws" "$conf" "$task"; return 0
+    fi
+  else
+    ws=""; conf="0"
+  fi
+  # Low confidence: ask when interactive, refuse when not.
+  if [[ -t 0 && -t 1 ]]; then
+    echo "codexw: not sure which workspace fits (best guess: ${ws:-none}, confidence ${conf})." >&2
+    PS3="Select workspace: "
+    local c
+    select c in "${workspaces[@]}"; do
+      [[ -n "${c:-}" ]] && { ROUTED_WS="$c"; break; }
+    done
+    ROUTED_TIER="picker"; ROUTED_CONF="user"
+    log_route picker "$ROUTED_WS" user "$task"
+  else
+    echo "codexw: routing ambiguous for \"$task\" (best guess: ${ws:-none}, confidence ${conf})." >&2
+    echo "codexw: rerun with an explicit workspace: codexw -d <workspace> \"task\"" >&2
+    log_route refused "${ws:-none}" "$conf" "$task"
+    exit 3
+  fi
+}
+
+# Ask for the general case and write it into routing.md under the right
+# workspace heading, so the router learns from the correction on its own.
+teach_route() { # right_ws task
+  local right="$1" task="$2" rule
+  printf 'codexw: what is the general rule? (one sentence, Enter to skip)\n> '
+  IFS= read -r rule || rule=""
+  [[ -n "$rule" ]] || rule="tasks like \"$task\" belong here"
+  if [[ -s "$RULES_MD" ]] && grep -q "^## $right" "$RULES_MD"; then
+    awk -v ws="## $right" -v add="- $rule" '{print} $0 == ws {print add}' \
+      "$RULES_MD" > "$RULES_MD.tmp" && mv "$RULES_MD.tmp" "$RULES_MD"
+  else
+    printf '\n## %s\n- %s\n' "$right" "$rule" >> "$RULES_MD"
+  fi
+  echo "codexw: added under \"## $right\" in routing.md"
+}
+
+# Echo the agent's pick and give a short window to override it. A correction
+# feeds teach_route so the rules file improves over time.
+confirm_route() { # task; reads/updates ROUTED_WS
+  local task="$1" ans corrected
+  printf 'codexw: routing to %s (confidence %s). Enter to accept, or type the right workspace: ' \
+    "$ROUTED_WS" "$ROUTED_CONF"
+  if read -t 8 -r ans && [[ -n "$ans" ]]; then
+    if corrected="$(resolve_ws "$ans")"; then
+      log_route corrected "$corrected" user "$task"
+      teach_route "$corrected" "$task"
+      ROUTED_WS="$corrected"
+    else
+      echo "codexw: '$ans' is not a workspace, keeping $ROUTED_WS" >&2
+    fi
+  else
+    echo
+  fi
+}
+
+# ---------- tmux helpers ----------
+have_session() { tmux has-session -t "$SESSION" 2>/dev/null; }
+
+resolve_target() { # id or name fragment -> window index
+  local q="$1"
+  have_session || { echo "codexw: no sessions running" >&2; exit 1; }
+  if [[ "$q" =~ ^[0-9]+$ ]]; then
+    tmux list-windows -t "$SESSION" -F '#{window_index}' | grep -qx "$q" \
+      || { echo "codexw: no session with id $q" >&2; exit 1; }
+    echo "$q"; return 0
+  fi
+  local hits
+  hits="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk -v q="$q" 'index($2,q){print $1}')"
+  [[ "$(wc -l <<<"$hits" | tr -d ' ')" == "1" && -n "$hits" ]] \
+    || { echo "codexw: '$q' matches $(wc -w <<<"$hits" | tr -d ' ') sessions, use an id from codexw ls" >&2; exit 1; }
+  echo "$hits"
+}
+
+slugify() {
+  tr '[:upper:]' '[:lower:]' <<<"$1" | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' | cut -c1-24 | sed -E 's/-+$//'
+}
+
+spawn() { # ws task detach(0/1)
+  local ws="$1" task="$2" detach="$3" name idx cmd ws_dir
+  name="$ws/$(slugify "$task")"
+  ws_dir="$HOME/.claude/workspaces/$ws"
+  [[ -d "$ws_dir" ]] || ws_dir="$HOME"
+  cmd="$PATH_EXPORT exec $(printf '%q' "$CODEX_WS") $(printf '%q' "$ws") -- $(printf '%q' "$task")"
+  if have_session; then
+    idx="$(tmux new-window -d -t "$SESSION" -n "$name" -c "$ws_dir" -P -F '#{window_index}' "$cmd")"
+  else
+    tmux new-session -d -s "$SESSION" -n "$name" -c "$ws_dir" "$cmd"
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index}' | head -1)"
+  fi
+  tmux set-option -w -t "$SESSION:$idx" remain-on-exit on
+  tmux set-option -w -t "$SESSION:$idx" automatic-rename off
+  tmux set-option -w -t "$SESSION:$idx" allow-rename off
+  tmux set-option -w -t "$SESSION:$idx" @cxw_task "$task"
+  tmux set-option -w -t "$SESSION:$idx" @cxw_ws "$ws"
+  tmux set-option -w -t "$SESSION:$idx" @cxw_started "$(date +%s)"
+  # the home chat pane mirrors the current window, so make a fresh spawn
+  # the visible chat right away
+  if "$TMUX_BIN" -L "$HOME_SOCKET" has-session -t home 2>/dev/null; then
+    tmux select-window -t "$SESSION:$idx" 2>/dev/null || true
+    mark_selected "$idx"
+  fi
+  if [[ "$detach" == "1" ]]; then
+    echo "spawned $idx  $name"
+  else
+    attach_to "$idx"
+  fi
+}
+
+attach_to() { # [index]
+  have_session || { echo "codexw: no sessions running" >&2; exit 1; }
+  local idx="${1:-}"
+  [[ -n "$idx" ]] && { tmux select-window -t "$SESSION:$idx"; mark_selected "$idx"; }
+  if [[ -n "${TMUX:-}" ]]; then
+    tmux switch-client -t "$SESSION"
+  else
+    exec "$TMUX_BIN" -L default attach -t "$SESSION"
+  fi
+}
+
+# busy = the model is working, input = it stopped on a question or permission
+# prompt and needs a human, idle = ready for the next prompt, done = exited.
+# Rendered as one symbol in the lists. The symbol goes through a plain %s
+# (never a padded field): bash printf pads by bytes and the dots are 3 byte
+# UTF-8, so byte padding would break column alignment.
+state_sym() {
+  case "$1" in
+    busy)  printf '●' ;;
+    idle)  printf '○' ;;
+    input) printf '?' ;;
+    done)  printf '×' ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
+# The same four states as a fixed width word. The home list is narrow enough
+# that a bare symbol needed a legend, and the legend did not fit either.
+state_word() {
+  case "$1" in
+    busy)  printf 'run ' ;;
+    idle)  printf 'idle' ;;
+    input) printf 'ask ' ;;
+    done)  printf 'done' ;;
+    *)     printf '%-4.4s' "$1" ;;
+  esac
+}
+window_state() { # index
+  local idx="$1" cap
+  if [[ "$(tmux display -p -t "$SESSION:$idx" '#{pane_dead}')" == "1" ]]; then
+    echo done; return
+  fi
+  cap="$(tmux capture-pane -p -t "$SESSION:$idx" -S -30 2>/dev/null || true)"
+  # Codex stops for three kinds of question, each with its own wording:
+  # a shell command ("Would you like to run the following command?"), an MCP
+  # tool call ("1. Allow ... enter to submit"), and folder trust ("Do you
+  # want to allow Codex to work in this folder?").
+  if grep -qE 'Do you want|1\. Yes|1\. Allow|Would you like to run|Always allow|Press enter to confirm|enter to submit|Select workspace' <<<"$cap"; then
+    echo input; return
+  fi
+  # The working spinner, e.g. "• Working (8s • esc to interrupt)". The
+  # clock form is matched too in case a later Codex drops the hint, as
+  # Claude Code did. This text check is what keeps a selected session
+  # honest during the selection grace window below.
+  if grep -qiE 'esc to interrupt|Working \([0-9]+(m [0-9]+)?s' <<<"$cap"; then
+    echo busy; return
+  fi
+  # a generating session repaints its spinner constantly, an idle one is
+  # silent, so recent pane output means the model is working. But selecting
+  # a window also produces output (focus-events makes the TUI repaint), so
+  # right after a selection this heuristic would show a false busy for one
+  # refresh. @cxw_seltime is stamped on every selection; skip the heuristic
+  # inside its grace window. The esc-to-interrupt check above still catches
+  # a session that is working.
+  local act sel
+  act="$(tmux display -p -t "$SESSION:$idx" '#{window_activity}' 2>/dev/null || echo 0)"
+  sel="$(tmux display -p -t "$SESSION:$idx" '#{@cxw_seltime}' 2>/dev/null || echo 0)"
+  sel="${sel:-0}"
+  local now; now="$(date +%s)"
+  if (( now - act < 5 )) && (( now - sel >= 8 )); then
+    echo busy; return
+  fi
+  echo idle
+}
+
+mark_selected() { # index; stamp the selection so window_state ignores the repaint
+  tmux set-option -w -t "$SESSION:$1" @cxw_seltime "$(date +%s)" 2>/dev/null || true
+}
+
+# ---------- the last message clock ----------
+# The lists used to sort on tmux's window_activity, which has a false positive:
+# focusing a window makes the TUI repaint, and that counts as activity, so
+# merely opening a chat floated it to the top. The rollout is the true clock.
+# Codex appends every turn to <CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl,
+# and the last response_item line in it (a message, a tool call or its
+# output) is the last real message. Bookkeeping lines (token counts, task
+# events) are ignored so an idle session does not move for no reason.
+#
+# Codex offers no way to choose the session id up front, so a window is
+# matched once by start time against the rollouts in its workspace's
+# CODEX_HOME and the match is cached on the window (@cxw_tlog). A window
+# with no rollout found keeps sorting on window_activity, so it can still
+# float on focus; nothing else does.
+codex_sessions_dir() { # ws -> the sessions dir of that workspace's CODEX_HOME
+  local ws="$1"
+  [[ -z "$ws" || "$ws" == "-" ]] && ws="master"
+  printf '%s/%s/sessions\n' "$CODEX_HOMES_DIR" "$ws"
+}
+
+find_transcript() { # index -> rollout born closest to @cxw_started, within a minute
+  local idx="$1" st ws d f b dd best="" bd=60
+  st="$(tmux display -p -t "$SESSION:$idx" '#{@cxw_started}' 2>/dev/null || true)"
+  ws="$(tmux display -p -t "$SESSION:$idx" '#{@cxw_ws}' 2>/dev/null || true)"
+  [[ "$st" =~ ^[0-9]+$ ]] || return 0
+  d="$(codex_sessions_dir "$ws")"
+  [[ -d "$d" ]] || return 0
+  while IFS= read -r f; do
+    b="$(stat -f %B "$f" 2>/dev/null || echo 0)"
+    dd=$(( b - st )); (( dd < 0 )) && dd=$(( -dd ))
+    (( dd < bd )) && { bd=$dd; best="$f"; }
+  done < <(find "$d" -name 'rollout-*.jsonl' 2>/dev/null)
+  [[ -n "$best" ]] && printf '%s\n' "$best"
+  return 0
+}
+
+window_transcript() { # index -> rollout path, resolved once and cached
+  local idx="$1" log
+  log="$(tmux display -p -t "$SESSION:$idx" '#{@cxw_tlog}' 2>/dev/null || true)"
+  if [[ -z "$log" ]]; then
+    log="$(find_transcript "$idx")"
+    [[ -n "$log" ]] && tmux set-option -w -t "$SESSION:$idx" @cxw_tlog "$log" 2>/dev/null
+  fi
+  [[ -n "$log" && -f "$log" ]] && printf '%s\n' "$log"
+  return 0
+}
+
+last_message_at() { # rollout -> epoch of its last response_item line
+  local ts
+  ts="$(tail -c 524288 "$1" 2>/dev/null | grep '"type":"response_item"' | tail -1 \
+    | sed -n 's/^{"timestamp":"\([0-9T:-]*\)[^"]*".*/\1/p')"
+  if [[ -n "$ts" ]] && date -j -u -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null; then
+    return 0
+  fi
+  stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+window_lastmsg() { # index -> epoch of the last real message, window_activity if unknown
+  local idx="$1" log
+  log="$(window_transcript "$idx")"
+  if [[ -n "$log" ]]; then last_message_at "$log"; return 0; fi
+  tmux display -p -t "$SESSION:$idx" '#{window_activity}' 2>/dev/null || echo 0
+}
+
+# The window listing every list is built from: each window as
+# lastmsg|<format>, run through order_rows. The format must start with
+# #{window_id}|#{window_index}|#{@cxw_ws}|#{window_name}, which is what
+# order_rows keys the master pin on.
+ordered_windows() { # tmux format -> ordered rows, key stripped
+  local idx line
+  tmux list-windows -t "$SESSION" -F "#{window_index}|$1" 2>/dev/null \
+    | while IFS='|' read -r idx line; do
+        printf '%s|%s\n' "$(window_lastmsg "$idx")" "$line"
+      done | order_rows
+}
+
+# Order a piped window listing (fields split on |) for display. The master row
+# is pinned at the top so it can never slide under a keypress meant for another
+# session; everything else is sorted by last message, most recent first, so the
+# session that a reply just landed in rises to the top of the list.
+#
+# Every input line must start with the last message timestamp and a |. That
+# leading field is stripped on the way out, so callers read the same fields they
+# always did: id|index|ws|name|... Windows sharing a timestamp keep their
+# window index order, which makes the sort stable and the pane calm.
+order_rows() {
+  awk -F'|' '
+    { act = $1 + 0; rest = substr($0, index($0, "|") + 1) }
+    ($5 == "master" || $3 == "0") && m == "" { m = rest; next }
+    { n++; key[n] = act; line[n] = rest }
+    END {
+      if (m != "") print m
+      for (i = 1; i <= n; i++) ord[i] = i
+      for (i = 2; i <= n; i++) {
+        v = ord[i]; j = i - 1
+        while (j >= 1 && key[ord[j]] < key[v]) { ord[j+1] = ord[j]; j-- }
+        ord[j+1] = v
+      }
+      for (i = 1; i <= n; i++) print line[ord[i]]
+    }'
+}
+
+rows() { # shared by ls and ui (fzf reloads call "codexw __rows")
+  # With --with-id each line is prefixed by the tmux window id and a tab.
+  # The id is stable for the life of the window; the index is not, so the
+  # UI keys every action off the id and never off the row position.
+  have_session || return 0
+  local now fmt withid=""
+  [[ "${1:-}" == "--with-id" ]] && withid=1
+  now="$(date +%s)"
+  fmt='#{window_id}|#{window_index}|#{@cxw_ws}|#{window_name}|#{@cxw_started}|#{@cxw_task}'
+  ordered_windows "$fmt" | while IFS='|' read -r wid idx ws name started task; do
+    local state age title
+    state="$(window_state "$idx")"
+    if [[ -n "$started" ]]; then
+      age=$(( (now - started) / 60 ))
+      if (( age >= 60 )); then age="$((age / 60))h"; else age="${age}m"; fi
+    else age="?"; fi
+    title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
+    [[ -n "$withid" ]] && printf '%s\t' "$wid"
+    printf '%-4s %-11s %-33s %s %-5s %s\n' "$idx" "${ws:--}" "$title" "$(state_sym "$state")" "$age" "${task:--}"
+  done
+}
+
+cmd_ls() {
+  have_session || { echo "no sessions"; exit 0; }
+  printf '%-4s %-11s %-33s %s %-5s %s\n' ID WS TITLE S AGE TASK
+  rows
+}
+
+# Kill one window by its stable tmux window id (e.g. @62), never by row position.
+# The UI passes the id of the row under the cursor, so a stale list or a moved
+# highlight can no longer take out a bystander. Refuses to kill master, and waits
+# until tmux has really dropped the window so the reload cannot redraw a ghost row.
+win_exists() { # window id -> 0 if tmux still has it
+  # display -p answers empty with status 0 for a dead id, so ask list-windows.
+  tmux list-windows -t "$SESSION" -F '#{window_id}' 2>/dev/null | grep -qx -- "$1"
+}
+
+kill_by_id() {
+  local wid="${1:-}" name idx ans i
+  [[ "$wid" == @* ]] || return 0
+  win_exists "$wid" || return 0
+  name="$(tmux display -p -t "$wid" '#{window_name}' 2>/dev/null)"
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null)"
+  # Nothing dies without the human reading back the name and the id first.
+  # A read that fails (no tty) cancels, so a scripted caller kills nothing.
+  if [[ -z "$name" || "$name" == "master" || "$idx" == "0" ]]; then
+    printf '\nmaster session %s (%s). type the word master to kill it: ' "${idx:-?}" "${name:-?}"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "master" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  else
+    printf '\nkill session %s (%s)? y to confirm: ' "$idx" "$name"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  fi
+  tmux kill-window -t "$wid" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    win_exists "$wid" || break
+    sleep 0.05
+  done
+}
+
+cmd_ui() {
+  have_session || { echo "no sessions"; exit 0; }
+  command -v fzf >/dev/null 2>&1 || { echo "codexw: fzf not installed (brew install fzf), showing the list instead" >&2; cmd_ls; exit 0; }
+  local me sel idx
+  me="$HOME/.claude/bin/codexw"
+  sel="$(rows --with-id | fzf \
+      --delimiter=$'\t' --with-nth='2..' \
+      --header 'enter attach   ctrl-x kill   ctrl-r refresh   (●=working, ?=needs you, ○=ready, ×=finished)' \
+      --preview "tmux capture-pane -p -t {1} | awk 'NF{f=1} f'" \
+      --preview-window 'right,58%' \
+      --bind "ctrl-r:reload($me __rows)" \
+      --bind "ctrl-x:execute($me __kill {1})+reload($me __rows)")" || exit 0
+  local wid
+  wid="${sel%%$'\t'*}"
+  [[ -n "$wid" && "$wid" == @* ]] || exit 0
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null)" || exit 0
+  [[ -n "$idx" ]] && attach_to "$idx"
+}
+
+cmd_peek() {
+  local idx lines="${2:-40}"
+  idx="$(resolve_target "$1")"
+  tmux capture-pane -p -t "$SESSION:$idx" -S "-$lines"
+}
+
+cmd_send() {
+  local idx text="$2"
+  idx="$(resolve_target "$1")"
+  tmux send-keys -t "$SESSION:$idx" -l -- "$text"
+  sleep 0.4
+  tmux send-keys -t "$SESSION:$idx" Enter
+  echo "sent to $idx"
+}
+
+cmd_kill() {
+  local idx name ans
+  idx="$(resolve_target "$1")"
+  name="$(tmux display -p -t "$SESSION:$idx" '#{window_name}' 2>/dev/null || true)"
+  if [[ "$name" == "master" || "$idx" == "0" ]]; then
+    # The master session is the one thing that must never go by accident.
+    if [[ -t 0 ]]; then
+      printf 'master session %s (%s). type the word master to kill it: ' "$idx" "${name:-?}"
+      IFS= read -r ans || { echo; return 0; }
+      [[ "$ans" == "master" ]] || { echo "cancelled"; return 0; }
+    else
+      echo "codexw: refusing to kill the master session $idx (${name:-?}) without a confirmation" >&2
+      return 1
+    fi
+  elif [[ -t 0 ]]; then
+    printf 'kill session %s (%s)? y to confirm: ' "$idx" "${name:-?}"
+    IFS= read -r ans || { echo; return 0; }
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "cancelled"; return 0; }
+  fi
+  tmux kill-window -t "$SESSION:$idx"
+  echo "killed $idx (${name:-?})"
+  # Killing the last window kills the session, which is fine.
+}
+
+cmd_master() {
+  local idx cmd seed
+  if have_session; then
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk '$2=="master"{print $1}')"
+    if [[ -n "$idx" ]]; then attach_to "$idx"; return; fi
+  fi
+  seed="You are the codexw master session. Start by running codexw ls, peek anything interesting, and give a short status."
+  # The master needs its own CODEX_HOME so its AGENTS.md is the orchestrator
+  # brief instead of a workspace brief. No MCP servers: it drives sub
+  # sessions through the codexw command, nothing else.
+  mkdir -p "$MASTER_WS_DIR"
+  ln -sf "$MASTER_MD" "$MASTER_WS_DIR/CLAUDE.md"
+  python3 "$BUILDER" master "$MASTER_WS_DIR" "$EMPTY_MCP" \
+    "$HOME/.codex" "$CODEX_HOMES_DIR/master" "$HOME/.claude/CLAUDE.md" >/dev/null
+  # Codex has no allowedTools list. Its equivalent is the sandbox policy, and
+  # the master's whole job is running codexw and tmux outside the workspace,
+  # so it gets full access with the model still free to ask when unsure.
+  cmd="$PATH_EXPORT export CODEX_HOME=$(printf '%q' "$CODEX_HOMES_DIR/master"); \
+exec $(printf '%q' "$CODEX_BIN_PATH") --sandbox danger-full-access \
+--ask-for-approval on-request $(printf '%q' "$seed")"
+  if have_session; then
+    idx="$(tmux new-window -d -t "$SESSION" -n master -c "$MASTER_WS_DIR" -P -F '#{window_index}' "$cmd")"
+  else
+    tmux new-session -d -s "$SESSION" -n master -c "$MASTER_WS_DIR" "$cmd"
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index}' | head -1)"
+  fi
+  tmux set-option -w -t "$SESSION:$idx" remain-on-exit on
+  tmux set-option -w -t "$SESSION:$idx" automatic-rename off
+  tmux set-option -w -t "$SESSION:$idx" allow-rename off
+  tmux set-option -w -t "$SESSION:$idx" @cxw_ws "-"
+  tmux set-option -w -t "$SESSION:$idx" @cxw_task "orchestrate the sub sessions"
+  tmux set-option -w -t "$SESSION:$idx" @cxw_started "$(date +%s)"
+  # master owns window 0: swap with whatever sits there, or move into the
+  # free slot (window options travel with the window either way)
+  if [[ "$idx" != "0" ]]; then
+    if tmux list-windows -t "$SESSION" -F '#{window_index}' | grep -qx 0; then
+      tmux swap-window -d -s "$SESSION:$idx" -t "$SESSION:0"
+    else
+      tmux move-window -d -s "$SESSION:$idx" -t "$SESSION:0"
+    fi
+    idx=0
+  fi
+  if [[ "${1:-}" == "-d" ]]; then echo "spawned $idx  master"; else attach_to "$idx"; fi
+}
+
+# ---------- the control room (codexw home) ----------
+# Outer layout on its own tmux socket: list pane left (fzf over the live
+# rows), chat pane right (a second client attached to the ws server, so
+# selecting a row is one select-window call on the inner server).
+
+cmd_open() { # stable tmux window id from the list, guard the hint row
+  local wid="${1:-}" idx
+  [[ "$wid" == @* ]] || return 0
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null || true)"
+  [[ -n "$idx" ]] || return 0
+  tmux select-window -t "$SESSION:$idx" 2>/dev/null || true
+  mark_selected "$idx"
+}
+
+cmd_gomaster() {
+  local idx=""
+  if have_session; then
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk '$2=="master"{print $1}')"
+  fi
+  if [[ -z "$idx" ]]; then
+    cmd_master -d >/dev/null
+    idx="$(tmux list-windows -t "$SESSION" -F '#{window_index} #{window_name}' | awk '$2=="master"{print $1}')"
+  fi
+  [[ -n "$idx" ]] && { tmux select-window -t "$SESSION:$idx"; mark_selected "$idx"; }
+}
+
+# x on the list. Keyed off the stable tmux window id of the row under the
+# cursor, and it always prints the name and the id back and waits for a yes
+# before anything dies. The master session needs its own word typed out: it
+# used to go on a stray x after a refresh had moved the highlight.
+cmd_guardkill() {
+  local wid="${1:-}" name idx st ans i
+  [[ "$wid" == @* ]] || return 0
+  if ! win_exists "$wid"; then printf '\nthat session is already gone\n'; sleep 1; return 0; fi
+  name="$(tmux display -p -t "$wid" '#{window_name}' 2>/dev/null || true)"
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null || true)"
+  [[ -n "$idx" ]] || return 0
+  st="$(window_state "$idx" 2>/dev/null || echo done)"
+  if [[ "$st" == "busy" ]]; then
+    printf '\nsession %s (%s) is busy, not killed\n' "$idx" "${name:-?}"
+    sleep 1.5
+    return 0
+  fi
+  if [[ "$name" == "master" || "$idx" == "0" ]]; then
+    printf '\nmaster session %s (%s). type the word master to kill it: ' "$idx" "${name:-?}"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "master" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  else
+    printf '\nkill session %s (%s)? y to confirm: ' "$idx" "${name:-?}"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  fi
+  tmux kill-window -t "$wid" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do win_exists "$wid" || break; sleep 0.05; done
+  printf 'killed %s (%s)\n' "$idx" "${name:-?}"
+  sleep 0.6
+}
+
+# How wide the list pane really is. The rows are laid out to fit it, so the
+# state never falls off the right edge on a narrow terminal.
+home_width() {
+  local w
+  w="$("$TMUX_BIN" -L "$HOME_SOCKET" display -p -t home:0.0 '#{pane_width}' 2>/dev/null || true)"
+  [[ "$w" =~ ^[0-9]+$ ]] && (( w > 0 )) || w=44
+  echo "$w"
+}
+
+# The row order the list pane shows, as stable tmux window ids. No pane
+# capture, so the anchor can be resolved on every single reload.
+home_ids() {
+  have_session || return 0
+  # Prefer the order the list pane last rendered. cmd_homerows publishes it, so
+  # the anchor is resolved against exactly the rows fzf is showing rather than
+  # against a fresh sort that activity may already have moved on. Ids of
+  # windows that have died since are dropped.
+  local live ordered
+  if [[ -s "$ORDER_FILE" ]]; then
+    live="$(tmux list-windows -t "$SESSION" -F '#{window_id}' 2>/dev/null || true)"
+    if [[ -n "$live" ]]; then
+      ordered="$(awk 'NR==FNR{ok[$0]=1;next} ($0 in ok)' \
+        <(printf '%s\n' "$live") "$ORDER_FILE" 2>/dev/null || true)"
+      [[ -n "$ordered" ]] && { printf '%s\n' "$ordered"; return 0; }
+    fi
+  fi
+  ordered_windows '#{window_id}|#{window_index}|#{@cxw_ws}|#{window_name}' | cut -d'|' -f1
+}
+
+# The selection is anchored to the window id under the cursor, never to the
+# row number, so a refresh that adds, removes or reorders rows leaves the
+# highlight on the same chat. fzf fires focus during a reload too, with the
+# cursor still on the old row number, so a refresh takes RELOAD_LOCK first
+# and the anchor is left alone until the reload has landed.
+cmd_anchor() { # window-id row-index(0 based)
+  [[ -e "$RELOAD_LOCK" ]] && return 0
+  [[ "${1:-}" == @* ]] || return 0
+  printf '%s %s\n' "$1" "$(( ${2:-0} + 1 ))" > "$ANCHOR_FILE"
+}
+
+cmd_reloadlock() { : > "$RELOAD_LOCK"; }
+
+# Printed straight back into fzf as an action by the load binding: put the
+# cursor back on the anchored session. If that session has gone, take the
+# nearest surviving row at the old position rather than snapping to the top.
+cmd_anchorpos() {
+  rm -f "$RELOAD_LOCK"
+  local wid="" pos="" i n
+  local ids=()
+  [[ -s "$ANCHOR_FILE" ]] || return 0
+  read -r wid pos < "$ANCHOR_FILE" || return 0
+  [[ -n "$wid" ]] || return 0
+  while IFS= read -r i; do ids+=("$i"); done < <(home_ids)
+  n=${#ids[@]}
+  (( n > 0 )) || return 0
+  for i in "${!ids[@]}"; do
+    if [[ "${ids[$i]}" == "$wid" ]]; then
+      # keep the remembered row number fresh, it is the fallback if this
+      # session is the one that disappears next
+      printf '%s %s\n' "$wid" "$(( i + 1 ))" > "$ANCHOR_FILE"
+      echo "pos($(( i + 1 )))"; return 0
+    fi
+  done
+  [[ "$pos" =~ ^[0-9]+$ ]] || pos=1
+  (( pos < 1 )) && pos=1
+  (( pos > n )) && pos=$n
+  # the anchored session is gone: adopt the neighbour that took its place,
+  # so the next refresh tracks a session that still exists
+  printf '%s %s\n' "${ids[$(( pos - 1 ))]}" "$pos" > "$ANCHOR_FILE"
+  echo "pos($pos)"
+}
+
+cmd_newtask() { # runs with the list pane's tty via fzf execute
+  local t
+  printf '\nnew task (Enter to cancel): '
+  IFS= read -r t || return 0
+  [[ -n "$t" ]] || return 0
+  "$HOME/.claude/bin/codexw" -d "$t" || { echo "spawn failed"; sleep 2; }
+}
+
+cmd_homerows() {
+  if ! have_session; then
+    printf -- '-\t---- none yet: n new, m master\n'
+    return 0
+  fi
+  # compact for the narrow pane: state, id, workspace, title, age, and a
+  # star on the window the chat pane is currently showing
+  local now fmt tw pw wscol
+  now="$(date +%s)"
+  # State first: the left edge is the one place fzf can never truncate, and
+  # the old layout put it last where a 44 column pane cut it off. What is
+  # left over after the fixed columns goes to the title, so a wider pane
+  # shows more of it and a narrow one still shows the state. Under 36
+  # columns the workspace column goes too, which keeps the title and the age
+  # readable instead of every row ending in fzf's truncation dots.
+  pw="$(home_width)"
+  if (( pw < 36 )); then wscol=0; tw=$(( pw - 19 )); else wscol=1; tw=$(( pw - 28 )); fi
+  (( tw < 6 )) && tw=6
+  (( tw > 40 )) && tw=40
+  # The window id leads every row as a hidden first field (fzf gets
+  # --with-nth=2.. so it never shows). The index moves when windows are
+  # swapped; the id does not, so it is what the cursor anchors to and what
+  # every action is keyed off.
+  fmt='#{window_id}|#{window_index}|#{@cxw_ws}|#{window_name}|#{@cxw_started}|#{window_active}'
+  # Sort once, then publish the resulting id order before printing the rows, so
+  # home_ids resolves the anchor against the very listing the pane is about to
+  # draw. The rename is atomic, so a concurrent reader never sees a half
+  # written order file.
+  local listing
+  listing="$(ordered_windows "$fmt")"
+  [[ -n "$listing" ]] || return 0
+  printf '%s\n' "$listing" | cut -d'|' -f1 > "$ORDER_FILE.tmp" 2>/dev/null \
+    && mv -f "$ORDER_FILE.tmp" "$ORDER_FILE" 2>/dev/null || true
+  printf '%s\n' "$listing" | while IFS='|' read -r wid idx ws name started active; do
+    local state age title mark
+    # a window can vanish between the listing and the state probe
+    state="$(window_state "$idx" 2>/dev/null || echo done)"
+    if [[ -n "$started" ]]; then
+      age=$(( (now - started) / 60 ))
+      if (( age >= 60 )); then age="$((age / 60))h"; else age="${age}m"; fi
+    else age="?"; fi
+    title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
+    ws="${ws:--}"; ws="${ws:0:8}"
+    mark=""; [[ "$active" == "1" ]] && mark="*"
+    printf '%s\t' "$wid"
+    if (( wscol )); then
+      printf '%s %s %-2s %-8s %-*s %-3s %s\n' \
+        "$(state_sym "$state")" "$(state_word "$state")" "$idx" \
+        "$ws" "$tw" "${title:0:$tw}" "$age" "$mark"
+    else
+      printf '%s %s %-2s %-*s %-3s %s\n' \
+        "$(state_sym "$state")" "$(state_word "$state")" "$idx" \
+        "$tw" "${title:0:$tw}" "$age" "$mark"
+    fi
+  done
+}
+
+cmd_homelist() { # the left pane process
+  local me="$HOME/.claude/bin/codexw" refresher
+  rm -f "$PORT_FILE" "$ANCHOR_FILE" "$RELOAD_LOCK" "$ORDER_FILE"
+  (
+    # Refresh the list via fzf's listen port, but only when the rows really
+    # changed: reloads repaint the pane (flicker), so skipping no-op reloads
+    # keeps it calm. reload-sync keeps the old rows on screen until the new
+    # ones are complete, and --track --id-nth=1 makes fzf move the cursor
+    # with its window id the instant the rows land, so the highlight never
+    # sits on the wrong chat while cmd_anchorpos catches up. Take RELOAD_LOCK first so the focus events fzf fires
+    # while the new rows land cannot overwrite the anchor with whatever row
+    # happens to sit at the old cursor line. cmd_anchorpos drops the lock
+    # and puts the cursor back on the anchored session.
+    # the refresher must survive anything: one transient failure under the
+    # script's errexit killed it silently and froze the list
+    set +e +o pipefail
+    last_hash=""; last_reload=0
+    while :; do
+      sleep "$HOME_POLL"
+      p="$(cat "$PORT_FILE" 2>/dev/null || true)"
+      [[ -n "$p" ]] || continue
+      # the age column rolls over on its own once a minute per session, so
+      # it is dropped from the comparison and refreshed on HOME_AGE_TICK
+      h="$("$me" __homerows 2>/dev/null | sed -E 's/ [0-9?]+[mh]? *(\*?)$/ \1/' | cksum || true)"
+      now="$(date +%s)"
+      if [[ -n "$h" && "$h" == "$last_hash" ]] && (( now - last_reload < HOME_AGE_TICK )); then
+        continue
+      fi
+      last_hash="$h"; last_reload="$now"
+      : > "$RELOAD_LOCK"
+      curl -s -X POST "http://localhost:$p" \
+        -d "reload-sync($me __homerows)" >/dev/null 2>&1 || rm -f "$RELOAD_LOCK"
+    done
+  ) &
+  refresher=$!
+  trap 'kill "$refresher" 2>/dev/null' EXIT
+  while :; do
+    "$me" __homerows | fzf \
+      --disabled --no-info --layout=reverse \
+      --delimiter=$'\t' --with-nth='2..' \
+      --track --id-nth=1 \
+      --prompt='' \
+      --header='enter open  m master  n new  x kill  ^r reload' \
+      --listen \
+      --bind "start:execute-silent(echo \$FZF_PORT > $PORT_FILE)" \
+      --bind "focus:execute-silent($me __anchor {1} {n})" \
+      --bind "load:transform($me __anchorpos)" \
+      --bind "enter:execute-silent($me __open {1})+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "ctrl-r:execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "m:execute-silent($me __gomaster)+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "n:execute($me __newtask)+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "x:execute($me __guardkill {1})+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind 'esc:ignore' || true
+    sleep 1
+  done
+}
+
+cmd_home() {
+  local T="$TMUX_BIN" me="$HOME/.claude/bin/codexw"
+  # something to look at: spawn the master if no sessions exist yet
+  have_session || cmd_master -d >/dev/null
+  if ! "$T" -L "$HOME_SOCKET" has-session -t home 2>/dev/null; then
+    "$T" -L "$HOME_SOCKET" new-session -d -s home -n main -x 220 -y 50 \
+      "$PATH_EXPORT exec $me __homelist"
+    "$T" -L "$HOME_SOCKET" set -g mouse on
+    "$T" -L "$HOME_SOCKET" set -g status off
+    "$T" -L "$HOME_SOCKET" set -g focus-events on
+    tmux set -g focus-events on 2>/dev/null || true
+    "$T" -L "$HOME_SOCKET" bind -n C-t select-pane -t :.+
+    # chat pane: a client on the inner server, reattaching if it ever drops
+    "$T" -L "$HOME_SOCKET" split-window -h -t home:0.0 -c "$HOME" \
+      "while :; do env -u TMUX $T -L default attach -t $SESSION 2>/dev/null; sleep 2; done"
+    "$T" -L "$HOME_SOCKET" resize-pane -t home:0.0 -x 44
+    # pin the list width: attaching with a different terminal size rescales
+    # panes proportionally and can crush the list to one column
+    "$T" -L "$HOME_SOCKET" set-hook -g client-attached 'resize-pane -t home:0.0 -x 44'
+    "$T" -L "$HOME_SOCKET" set-hook -g client-resized 'resize-pane -t home:0.0 -x 44'
+    "$T" -L "$HOME_SOCKET" select-pane -t home:0.0
+    # one set of chrome: the outer layout owns the screen
+    tmux set -t "$SESSION" status off 2>/dev/null || true
+  fi
+  if [[ "${1:-}" == "-d" ]]; then echo "home ready, attach with: codexw home"; return 0; fi
+  exec env -u TMUX "$T" -L "$HOME_SOCKET" attach -t home
+}
+
+# ---------- CLI ----------
+detach=0
+headless=0
+
+case "${1:-}" in
+  ls|list)  cmd_ls; exit 0 ;;
+  ui)       cmd_ui; exit 0 ;;
+  __rows)   rows --with-id; exit 0 ;;
+  __kill)   kill_by_id "${2:-}"; exit 0 ;;
+  a|attach) shift; attach_to "$( [[ $# -ge 1 ]] && resolve_target "$1" || echo "" )"; exit 0 ;;
+  peek)     shift; [[ $# -ge 1 ]] || { echo "usage: codexw peek <id> [lines]" >&2; exit 1; }
+            cmd_peek "$@"; exit 0 ;;
+  send)     shift; [[ $# -ge 2 ]] || { echo "usage: codexw send <id> \"text\"" >&2; exit 1; }
+            cmd_send "$1" "$2"; exit 0 ;;
+  kill)     shift; [[ $# -ge 1 ]] || { echo "usage: codexw kill <id>" >&2; exit 1; }
+            cmd_kill "$1"; exit 0 ;;
+  master)   shift || true; cmd_master "${1:-}"; exit 0 ;;
+  home)     shift || true; cmd_home "${1:-}"; exit 0 ;;
+  __homerows) cmd_homerows; exit 0 ;;
+  __lastmsg) window_lastmsg "${2:?index}"; exit 0 ;;
+  __homelist) cmd_homelist; exit 0 ;;
+  __open)     shift; cmd_open "${1:-}"; exit 0 ;;
+  __gomaster) cmd_gomaster; exit 0 ;;
+  __guardkill) shift; cmd_guardkill "${1:-}"; exit 0 ;;
+  __anchor)    shift; cmd_anchor "${1:-}" "${2:-0}"; exit 0 ;;
+  __anchorpos) cmd_anchorpos; exit 0 ;;
+  __reloadlock) cmd_reloadlock; exit 0 ;;
+  __newtask)  cmd_newtask; exit 0 ;;
+  route)    shift; [[ $# -ge 1 ]] || { echo "usage: codexw route \"task\"" >&2; exit 1; }
+            route_decide "$*"
+            echo "workspace=$ROUTED_WS tier=$ROUTED_TIER confidence=$ROUTED_CONF"; exit 0 ;;
+  -h|--help)
+            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "")
+            # Bare codexw opens the picker when sessions exist, help otherwise.
+            if have_session; then cmd_ui; exit 0; fi
+            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -d)       detach=1; shift ;;
+  -p)       headless=1; shift ;;
+esac
+
+[[ $# -ge 1 ]] || { echo "codexw: nothing to do, try codexw --help" >&2; exit 1; }
+
+# Explicit workspace as first arg?
+ws=""
+if w="$(resolve_ws "$1")"; then
+  ws="$w"; shift
+  log_route 1 "$ws" 1.0 "${*:-<none>}"
+fi
+
+if [[ $# -eq 0 ]]; then
+  # Bare "codexw hebbian": plain codex-ws in this terminal, no tmux.
+  [[ -n "$ws" ]] || { echo "codexw: give me a task" >&2; exit 1; }
+  exec "$CODEX_WS" "$ws"
+fi
+
+task="$*"
+if [[ -z "$ws" ]]; then
+  route_decide "$task"
+  # Echo the pick and allow a quick correction, interactive spawns only.
+  if [[ "$ROUTED_TIER" == "agent" && -t 0 && -t 1 && "$headless" != "1" ]]; then
+    confirm_route "$task"
+  fi
+  ws="$ROUTED_WS"
+fi
+
+if [[ "$headless" == "1" ]]; then
+  exec "$CODEX_WS" "$ws" -- exec "$task"
+fi
+
+spawn "$ws" "$task" "$detach"

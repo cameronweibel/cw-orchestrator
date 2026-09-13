@@ -32,6 +32,16 @@ ROUTER_MODEL="haiku"
 PATH_EXPORT="export PATH=\"$HOME/.claude/bin:/opt/homebrew/bin:$HOME/.local/bin:\$PATH\";"
 HOME_SOCKET="cwhome"
 PORT_FILE="$ORC_DIR/.home_port"
+ANCHOR_FILE="$ORC_DIR/.home_anchor"
+ORDER_FILE="$ORC_DIR/.home_order"
+RELOAD_LOCK="$ORC_DIR/.home_reloading"
+# Home list refresh cadence. The refresher recomputes the rows every
+# HOME_POLL seconds and only pushes a reload when they changed. The age
+# column is left out of that comparison (it ticks on its own), so a separate
+# HOME_AGE_TICK forces one reload a minute to keep the ages honest. ctrl-r
+# in the list forces a reload right away.
+HOME_POLL=12
+HOME_AGE_TICK=60
 TMUX_BIN="$(command -v tmux)"
 
 # Every cw tmux call targets the default server explicitly. Without this,
@@ -187,7 +197,10 @@ spawn() { # ws task detach(0/1)
   name="$ws/$(slugify "$task")"
   ws_dir="$HOME/.claude/workspaces/$ws"
   [[ -d "$ws_dir" ]] || ws_dir="$HOME"
-  cmd="$PATH_EXPORT exec $(printf '%q' "$CLAUDE_WS") $(printf '%q' "$ws") -- $(printf '%q' "$task")"
+  # A session id chosen here, not by claude, so the window can find its own
+  # transcript by id (see window_transcript).
+  local sid; sid="$(new_sid)"
+  cmd="$PATH_EXPORT exec $(printf '%q' "$CLAUDE_WS") $(printf '%q' "$ws") -- --session-id $sid $(printf '%q' "$task")"
   if have_session; then
     idx="$(tmux new-window -d -t "$SESSION" -n "$name" -c "$ws_dir" -P -F '#{window_index}' "$cmd")"
   else
@@ -200,6 +213,7 @@ spawn() { # ws task detach(0/1)
   tmux set-option -w -t "$SESSION:$idx" @cw_task "$task"
   tmux set-option -w -t "$SESSION:$idx" @cw_ws "$ws"
   tmux set-option -w -t "$SESSION:$idx" @cw_started "$(date +%s)"
+  tmux set-option -w -t "$SESSION:$idx" @cw_sid "$sid"
   # the home chat pane mirrors the current window, so make a fresh spawn
   # the visible chat right away
   if "$TMUX_BIN" -L "$HOME_SOCKET" has-session -t home 2>/dev/null; then
@@ -238,6 +252,18 @@ state_sym() {
     *)     printf '%s' "$1" ;;
   esac
 }
+
+# The same four states as a fixed width word. The home list is narrow enough
+# that a bare symbol needed a legend, and the legend did not fit either.
+state_word() {
+  case "$1" in
+    busy)  printf 'run ' ;;
+    idle)  printf 'idle' ;;
+    input) printf 'ask ' ;;
+    done)  printf 'done' ;;
+    *)     printf '%-4.4s' "$1" ;;
+  esac
+}
 window_state() { # index
   local idx="$1" cap
   if [[ "$(tmux display -p -t "$SESSION:$idx" '#{pane_dead}')" == "1" ]]; then
@@ -247,7 +273,12 @@ window_state() { # index
   if grep -qE 'Do you want|1\. Yes|Select workspace' <<<"$cap"; then
     echo input; return
   fi
-  if grep -q 'esc to interrupt' <<<"$cap"; then
+  # The working spinner. Older Claude Code printed "esc to interrupt" on
+  # it; the current one prints a verb with a running clock and token count,
+  # e.g. "Clauding… (19m 21s · ↓ 52.5k tokens)". Either means busy, and
+  # this text check is what keeps a selected session honest during the
+  # selection grace window below.
+  if grep -qE 'esc to interrupt|… \([0-9]+(m [0-9]+)?s( · |\))|↓ [0-9.]+k? tokens' <<<"$cap"; then
     echo busy; return
   fi
   # a generating session repaints its spinner constantly, an idle one is
@@ -272,19 +303,127 @@ mark_selected() { # index; stamp the selection so window_state ignores the repai
   tmux set-option -w -t "$SESSION:$1" @cw_seltime "$(date +%s)" 2>/dev/null || true
 }
 
-# Reorder a piped window listing (fields split on |, name in field 3) so the
-# master row always comes first; the rest keep their window index order.
-pin_master() {
-  awk -F'|' '$3=="master"{m=$0; next} {rest[++n]=$0}
-    END{if(m) print m; for(i=1;i<=n;i++) print rest[i]}'
+# ---------- the last message clock ----------
+# The lists used to sort on tmux's window_activity, which has a false positive:
+# focusing a window makes the TUI repaint, and that counts as activity, so
+# merely opening a chat floated it to the top. The transcript is the true
+# clock. Every session appends to ~/.claude/projects/<cwd encoded>/<session
+# id>.jsonl, and the last user or assistant line in it is the last real
+# message. The file's mtime is not good enough on its own: Claude Code also
+# appends bookkeeping lines (away_summary and friends) to idle sessions, which
+# would move them for no reason, so the line timestamp is what counts.
+#
+# Windows spawned by this version pick their session id up front (@cw_sid)
+# and hand it to claude with --session-id, so the transcript is found by id
+# alone (claude-ws changes into the workspace dir, so the project dir is not
+# known until the session is running). Older windows are matched once by
+# start time against the transcripts in their cwd's project dir. Either way
+# the path is cached on the window as @cw_tlog. A window with no transcript
+# at all keeps sorting on window_activity, so it can still float on focus;
+# nothing else does.
+transcript_dir() { # cwd -> the Claude Code project dir holding its transcripts
+  printf '%s/.claude/projects/%s\n' "$HOME" "$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')"
+}
+
+new_sid() { uuidgen | tr '[:upper:]' '[:lower:]'; }
+
+find_transcript() { # index -> transcript born closest to @cw_started, within a minute
+  local idx="$1" st cwd d f b dd best="" bd=60
+  st="$(tmux display -p -t "$SESSION:$idx" '#{@cw_started}' 2>/dev/null || true)"
+  cwd="$(tmux display -p -t "$SESSION:$idx" '#{pane_current_path}' 2>/dev/null || true)"
+  [[ "$st" =~ ^[0-9]+$ && -n "$cwd" ]] || return 0
+  d="$(transcript_dir "$cwd")"
+  for f in "$d"/*.jsonl; do
+    [[ -f "$f" ]] || continue
+    b="$(stat -f %B "$f" 2>/dev/null || echo 0)"
+    dd=$(( b - st )); (( dd < 0 )) && dd=$(( -dd ))
+    (( dd < bd )) && { bd=$dd; best="$f"; }
+  done
+  [[ -n "$best" ]] && printf '%s\n' "$best"
+  return 0
+}
+
+window_transcript() { # index -> transcript path, resolved once and cached
+  local idx="$1" log sid f
+  log="$(tmux display -p -t "$SESSION:$idx" '#{@cw_tlog}' 2>/dev/null || true)"
+  if [[ -z "$log" ]]; then
+    sid="$(tmux display -p -t "$SESSION:$idx" '#{@cw_sid}' 2>/dev/null || true)"
+    if [[ -n "$sid" ]]; then
+      for f in "$HOME/.claude/projects"/*/"$sid.jsonl"; do [[ -f "$f" ]] && { log="$f"; break; }; done
+    else
+      log="$(find_transcript "$idx")"
+    fi
+    [[ -n "$log" ]] && tmux set-option -w -t "$SESSION:$idx" @cw_tlog "$log" 2>/dev/null
+  fi
+  [[ -n "$log" && -f "$log" ]] && printf '%s\n' "$log"
+  return 0
+}
+
+last_message_at() { # transcript -> epoch of its last user or assistant line
+  local ts
+  ts="$(tail -c 524288 "$1" 2>/dev/null | grep -E '"type":"(user|assistant)"' | tail -1 \
+    | sed -n 's/.*"timestamp":"\([0-9T:-]*\)[^"]*".*/\1/p')"
+  if [[ -n "$ts" ]] && date -j -u -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null; then
+    return 0
+  fi
+  stat -f %m "$1" 2>/dev/null || echo 0
+}
+
+window_lastmsg() { # index -> epoch of the last real message, window_activity if unknown
+  local idx="$1" log
+  log="$(window_transcript "$idx")"
+  if [[ -n "$log" ]]; then last_message_at "$log"; return 0; fi
+  tmux display -p -t "$SESSION:$idx" '#{window_activity}' 2>/dev/null || echo 0
+}
+
+# The window listing every list is built from: each window as
+# lastmsg|<format>, run through order_rows. The format must start with
+# #{window_id}|#{window_index}|#{@cw_ws}|#{window_name}, which is what
+# order_rows keys the master pin on.
+ordered_windows() { # tmux format -> ordered rows, key stripped
+  local idx line
+  tmux list-windows -t "$SESSION" -F "#{window_index}|$1" 2>/dev/null \
+    | while IFS='|' read -r idx line; do
+        printf '%s|%s\n' "$(window_lastmsg "$idx")" "$line"
+      done | order_rows
+}
+
+# Order a piped window listing (fields split on |) for display. The master row
+# is pinned at the top so it can never slide under a keypress meant for another
+# session; everything else is sorted by last message, most recent first, so the
+# session that a reply just landed in rises to the top of the list.
+#
+# Every input line must start with the last message timestamp and a |. That
+# leading field is stripped on the way out, so callers read the same fields they
+# always did: id|index|ws|name|... Windows sharing a timestamp keep their
+# window index order, which makes the sort stable and the pane calm.
+order_rows() {
+  awk -F'|' '
+    { act = $1 + 0; rest = substr($0, index($0, "|") + 1) }
+    ($5 == "master" || $3 == "0") && m == "" { m = rest; next }
+    { n++; key[n] = act; line[n] = rest }
+    END {
+      if (m != "") print m
+      for (i = 1; i <= n; i++) ord[i] = i
+      for (i = 2; i <= n; i++) {
+        v = ord[i]; j = i - 1
+        while (j >= 1 && key[ord[j]] < key[v]) { ord[j+1] = ord[j]; j-- }
+        ord[j+1] = v
+      }
+      for (i = 1; i <= n; i++) print line[ord[i]]
+    }'
 }
 
 rows() { # shared by ls and ui (fzf reloads call "cw __rows")
+  # With --with-id each line is prefixed by the tmux window id and a tab.
+  # The id is stable for the life of the window; the index is not, so the
+  # UI keys every action off the id and never off the row position.
   have_session || return 0
-  local now fmt
+  local now fmt withid=""
+  [[ "${1:-}" == "--with-id" ]] && withid=1
   now="$(date +%s)"
-  fmt='#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{@cw_task}'
-  tmux list-windows -t "$SESSION" -F "$fmt" | pin_master | while IFS='|' read -r idx ws name started task; do
+  fmt='#{window_id}|#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{@cw_task}'
+  ordered_windows "$fmt" | while IFS='|' read -r wid idx ws name started task; do
     local state age title
     state="$(window_state "$idx")"
     if [[ -n "$started" ]]; then
@@ -292,6 +431,7 @@ rows() { # shared by ls and ui (fzf reloads call "cw __rows")
       if (( age >= 60 )); then age="$((age / 60))h"; else age="${age}m"; fi
     else age="?"; fi
     title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
+    [[ -n "$withid" ]] && printf '%s\t' "$wid"
     printf '%-4s %-11s %-33s %s %-5s %s\n' "$idx" "${ws:--}" "$title" "$(state_sym "$state")" "$age" "${task:--}"
   done
 }
@@ -302,18 +442,55 @@ cmd_ls() {
   rows
 }
 
+# Kill one window by its stable tmux window id (e.g. @62), never by row position.
+# The UI passes the id of the row under the cursor, so a stale list or a moved
+# highlight can no longer take out a bystander. Refuses to kill master, and waits
+# until tmux has really dropped the window so the reload cannot redraw a ghost row.
+win_exists() { # window id -> 0 if tmux still has it
+  # display -p answers empty with status 0 for a dead id, so ask list-windows.
+  tmux list-windows -t "$SESSION" -F '#{window_id}' 2>/dev/null | grep -qx -- "$1"
+}
+
+kill_by_id() {
+  local wid="${1:-}" name idx ans i
+  [[ "$wid" == @* ]] || return 0
+  win_exists "$wid" || return 0
+  name="$(tmux display -p -t "$wid" '#{window_name}' 2>/dev/null)"
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null)"
+  # Nothing dies without the human reading back the name and the id first.
+  # A read that fails (no tty) cancels, so a scripted caller kills nothing.
+  if [[ -z "$name" || "$name" == "master" || "$idx" == "0" ]]; then
+    printf '\nmaster session %s (%s). type the word master to kill it: ' "${idx:-?}" "${name:-?}"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "master" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  else
+    printf '\nkill session %s (%s)? y to confirm: ' "$idx" "$name"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  fi
+  tmux kill-window -t "$wid" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    win_exists "$wid" || break
+    sleep 0.05
+  done
+}
+
 cmd_ui() {
   have_session || { echo "no sessions"; exit 0; }
   command -v fzf >/dev/null 2>&1 || { echo "cw: fzf not installed (brew install fzf), showing the list instead" >&2; cmd_ls; exit 0; }
   local me sel idx
   me="$HOME/.claude/bin/cw"
-  sel="$(rows | fzf \
+  sel="$(rows --with-id | fzf \
+      --delimiter=$'\t' --with-nth='2..' \
       --header 'enter attach   ctrl-x kill   ctrl-r refresh   (●=working, ?=needs you, ○=ready, ×=finished)' \
-      --preview "tmux capture-pane -p -t $SESSION:{1} | awk 'NF{f=1} f'" \
+      --preview "tmux capture-pane -p -t {1} | awk 'NF{f=1} f'" \
       --preview-window 'right,58%' \
       --bind "ctrl-r:reload($me __rows)" \
-      --bind "ctrl-x:execute-silent(tmux kill-window -t $SESSION:{1})+reload($me __rows)")" || exit 0
-  idx="$(awk '{print $1}' <<<"$sel")"
+      --bind "ctrl-x:execute($me __kill {1})+reload($me __rows)")" || exit 0
+  local wid
+  wid="${sel%%$'\t'*}"
+  [[ -n "$wid" && "$wid" == @* ]] || exit 0
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null)" || exit 0
   [[ -n "$idx" ]] && attach_to "$idx"
 }
 
@@ -333,10 +510,26 @@ cmd_send() {
 }
 
 cmd_kill() {
-  local idx
+  local idx name ans
   idx="$(resolve_target "$1")"
+  name="$(tmux display -p -t "$SESSION:$idx" '#{window_name}' 2>/dev/null || true)"
+  if [[ "$name" == "master" || "$idx" == "0" ]]; then
+    # The master session is the one thing that must never go by accident.
+    if [[ -t 0 ]]; then
+      printf 'master session %s (%s). type the word master to kill it: ' "$idx" "${name:-?}"
+      IFS= read -r ans || { echo; return 0; }
+      [[ "$ans" == "master" ]] || { echo "cancelled"; return 0; }
+    else
+      echo "cw: refusing to kill the master session $idx (${name:-?}) without a confirmation" >&2
+      return 1
+    fi
+  elif [[ -t 0 ]]; then
+    printf 'kill session %s (%s)? y to confirm: ' "$idx" "${name:-?}"
+    IFS= read -r ans || { echo; return 0; }
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "cancelled"; return 0; }
+  fi
   tmux kill-window -t "$SESSION:$idx"
-  echo "killed $idx"
+  echo "killed $idx (${name:-?})"
   # Killing the last window kills the session, which is fine.
 }
 
@@ -349,7 +542,8 @@ cmd_master() {
   seed="You are the cw master session. Start by running cw ls, peek anything interesting, and give a short status."
   # The prompt goes FIRST: variadic flags like --allowedTools would swallow
   # a trailing positional argument.
-  cmd="$PATH_EXPORT exec claude $(printf '%q' "$seed") \
+  local sid; sid="$(new_sid)"
+  cmd="$PATH_EXPORT exec claude --session-id $sid $(printf '%q' "$seed") \
 --strict-mcp-config --mcp-config=$(printf '%q' "$EMPTY_MCP") \
 --append-system-prompt \"\$(cat $(printf '%q' "$MASTER_MD"))\" \
 --allowedTools $(printf '%q' 'Bash(cw:*)') $(printf '%q' 'Bash(tmux:*)')"
@@ -365,6 +559,7 @@ cmd_master() {
   tmux set-option -w -t "$SESSION:$idx" @cw_ws "-"
   tmux set-option -w -t "$SESSION:$idx" @cw_task "orchestrate the sub sessions"
   tmux set-option -w -t "$SESSION:$idx" @cw_started "$(date +%s)"
+  tmux set-option -w -t "$SESSION:$idx" @cw_sid "$sid"
   # master owns window 0: swap with whatever sits there, or move into the
   # free slot (window options travel with the window either way)
   if [[ "$idx" != "0" ]]; then
@@ -383,10 +578,13 @@ cmd_master() {
 # rows), chat pane right (a second client attached to the ws server, so
 # selecting a row is one select-window call on the inner server).
 
-cmd_open() { # window index from the list, guard non numeric hint rows
-  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
-  tmux select-window -t "$SESSION:$1" 2>/dev/null || true
-  mark_selected "$1"
+cmd_open() { # stable tmux window id from the list, guard the hint row
+  local wid="${1:-}" idx
+  [[ "$wid" == @* ]] || return 0
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null || true)"
+  [[ -n "$idx" ]] || return 0
+  tmux select-window -t "$SESSION:$idx" 2>/dev/null || true
+  mark_selected "$idx"
 }
 
 cmd_gomaster() {
@@ -401,15 +599,108 @@ cmd_gomaster() {
   [[ -n "$idx" ]] && { tmux select-window -t "$SESSION:$idx"; mark_selected "$idx"; }
 }
 
+# x on the list. Keyed off the stable tmux window id of the row under the
+# cursor, and it always prints the name and the id back and waits for a yes
+# before anything dies. The master session needs its own word typed out: it
+# used to go on a stray x after a refresh had moved the highlight.
 cmd_guardkill() {
-  local idx="${1:-}" st
-  [[ "$idx" =~ ^[0-9]+$ ]] || return 0
+  local wid="${1:-}" name idx st ans i
+  [[ "$wid" == @* ]] || return 0
+  if ! win_exists "$wid"; then printf '\nthat session is already gone\n'; sleep 1; return 0; fi
+  name="$(tmux display -p -t "$wid" '#{window_name}' 2>/dev/null || true)"
+  idx="$(tmux display -p -t "$wid" '#{window_index}' 2>/dev/null || true)"
+  [[ -n "$idx" ]] || return 0
   st="$(window_state "$idx" 2>/dev/null || echo done)"
   if [[ "$st" == "busy" ]]; then
-    "$TMUX_BIN" -L "$HOME_SOCKET" display-message "session $idx is busy, not killed" 2>/dev/null || true
+    printf '\nsession %s (%s) is busy, not killed\n' "$idx" "${name:-?}"
+    sleep 1.5
     return 0
   fi
-  tmux kill-window -t "$SESSION:$idx" 2>/dev/null || true
+  if [[ "$name" == "master" || "$idx" == "0" ]]; then
+    printf '\nmaster session %s (%s). type the word master to kill it: ' "$idx" "${name:-?}"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "master" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  else
+    printf '\nkill session %s (%s)? y to confirm: ' "$idx" "${name:-?}"
+    IFS= read -r ans || return 0
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { printf 'cancelled\n'; sleep 1; return 0; }
+  fi
+  tmux kill-window -t "$wid" 2>/dev/null || true
+  for i in 1 2 3 4 5 6 7 8 9 10; do win_exists "$wid" || break; sleep 0.05; done
+  printf 'killed %s (%s)\n' "$idx" "${name:-?}"
+  sleep 0.6
+}
+
+# How wide the list pane really is. The rows are laid out to fit it, so the
+# state never falls off the right edge on a narrow terminal.
+home_width() {
+  local w
+  w="$("$TMUX_BIN" -L "$HOME_SOCKET" display -p -t home:0.0 '#{pane_width}' 2>/dev/null || true)"
+  [[ "$w" =~ ^[0-9]+$ ]] && (( w > 0 )) || w=44
+  echo "$w"
+}
+
+# The row order the list pane shows, as stable tmux window ids. No pane
+# capture, so the anchor can be resolved on every single reload.
+home_ids() {
+  have_session || return 0
+  # Prefer the order the list pane last rendered. cmd_homerows publishes it, so
+  # the anchor is resolved against exactly the rows fzf is showing rather than
+  # against a fresh sort that activity may already have moved on. Ids of
+  # windows that have died since are dropped.
+  local live ordered
+  if [[ -s "$ORDER_FILE" ]]; then
+    live="$(tmux list-windows -t "$SESSION" -F '#{window_id}' 2>/dev/null || true)"
+    if [[ -n "$live" ]]; then
+      ordered="$(awk 'NR==FNR{ok[$0]=1;next} ($0 in ok)' \
+        <(printf '%s\n' "$live") "$ORDER_FILE" 2>/dev/null || true)"
+      [[ -n "$ordered" ]] && { printf '%s\n' "$ordered"; return 0; }
+    fi
+  fi
+  ordered_windows '#{window_id}|#{window_index}|#{@cw_ws}|#{window_name}' | cut -d'|' -f1
+}
+
+# The selection is anchored to the window id under the cursor, never to the
+# row number, so a refresh that adds, removes or reorders rows leaves the
+# highlight on the same chat. fzf fires focus during a reload too, with the
+# cursor still on the old row number, so a refresh takes RELOAD_LOCK first
+# and the anchor is left alone until the reload has landed.
+cmd_anchor() { # window-id row-index(0 based)
+  [[ -e "$RELOAD_LOCK" ]] && return 0
+  [[ "${1:-}" == @* ]] || return 0
+  printf '%s %s\n' "$1" "$(( ${2:-0} + 1 ))" > "$ANCHOR_FILE"
+}
+
+cmd_reloadlock() { : > "$RELOAD_LOCK"; }
+
+# Printed straight back into fzf as an action by the load binding: put the
+# cursor back on the anchored session. If that session has gone, take the
+# nearest surviving row at the old position rather than snapping to the top.
+cmd_anchorpos() {
+  rm -f "$RELOAD_LOCK"
+  local wid="" pos="" i n
+  local ids=()
+  [[ -s "$ANCHOR_FILE" ]] || return 0
+  read -r wid pos < "$ANCHOR_FILE" || return 0
+  [[ -n "$wid" ]] || return 0
+  while IFS= read -r i; do ids+=("$i"); done < <(home_ids)
+  n=${#ids[@]}
+  (( n > 0 )) || return 0
+  for i in "${!ids[@]}"; do
+    if [[ "${ids[$i]}" == "$wid" ]]; then
+      # keep the remembered row number fresh, it is the fallback if this
+      # session is the one that disappears next
+      printf '%s %s\n' "$wid" "$(( i + 1 ))" > "$ANCHOR_FILE"
+      echo "pos($(( i + 1 )))"; return 0
+    fi
+  done
+  [[ "$pos" =~ ^[0-9]+$ ]] || pos=1
+  (( pos < 1 )) && pos=1
+  (( pos > n )) && pos=$n
+  # the anchored session is gone: adopt the neighbour that took its place,
+  # so the next refresh tracks a session that still exists
+  printf '%s %s\n' "${ids[$(( pos - 1 ))]}" "$pos" > "$ANCHOR_FILE"
+  echo "pos($pos)"
 }
 
 cmd_newtask() { # runs with the list pane's tty via fzf execute
@@ -422,15 +713,38 @@ cmd_newtask() { # runs with the list pane's tty via fzf execute
 
 cmd_homerows() {
   if ! have_session; then
-    printf -- '-  none yet: n new, m master\n'
+    printf -- '-\t---- none yet: n new, m master\n'
     return 0
   fi
-  # compact for the narrow pane: id, workspace, title, state, age, and a
+  # compact for the narrow pane: state, id, workspace, title, age, and a
   # star on the window the chat pane is currently showing
-  local now fmt
+  local now fmt tw pw wscol
   now="$(date +%s)"
-  fmt='#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{window_active}'
-  tmux list-windows -t "$SESSION" -F "$fmt" | pin_master | while IFS='|' read -r idx ws name started active; do
+  # State first: the left edge is the one place fzf can never truncate, and
+  # the old layout put it last where a 44 column pane cut it off. What is
+  # left over after the fixed columns goes to the title, so a wider pane
+  # shows more of it and a narrow one still shows the state. Under 36
+  # columns the workspace column goes too, which keeps the title and the age
+  # readable instead of every row ending in fzf's truncation dots.
+  pw="$(home_width)"
+  if (( pw < 36 )); then wscol=0; tw=$(( pw - 19 )); else wscol=1; tw=$(( pw - 28 )); fi
+  (( tw < 6 )) && tw=6
+  (( tw > 40 )) && tw=40
+  # The window id leads every row as a hidden first field (fzf gets
+  # --with-nth=2.. so it never shows). The index moves when windows are
+  # swapped; the id does not, so it is what the cursor anchors to and what
+  # every action is keyed off.
+  fmt='#{window_id}|#{window_index}|#{@cw_ws}|#{window_name}|#{@cw_started}|#{window_active}'
+  # Sort once, then publish the resulting id order before printing the rows, so
+  # home_ids resolves the anchor against the very listing the pane is about to
+  # draw. The rename is atomic, so a concurrent reader never sees a half
+  # written order file.
+  local listing
+  listing="$(ordered_windows "$fmt")"
+  [[ -n "$listing" ]] || return 0
+  printf '%s\n' "$listing" | cut -d'|' -f1 > "$ORDER_FILE.tmp" 2>/dev/null \
+    && mv -f "$ORDER_FILE.tmp" "$ORDER_FILE" 2>/dev/null || true
+  printf '%s\n' "$listing" | while IFS='|' read -r wid idx ws name started active; do
     local state age title mark
     # a window can vanish between the listing and the state probe
     state="$(window_state "$idx" 2>/dev/null || echo done)"
@@ -439,34 +753,53 @@ cmd_homerows() {
       if (( age >= 60 )); then age="$((age / 60))h"; else age="${age}m"; fi
     else age="?"; fi
     title="${name#*/}"; [[ "$name" == "master" ]] && { title="master"; ws="-"; }
+    ws="${ws:--}"; ws="${ws:0:8}"
     mark=""; [[ "$active" == "1" ]] && mark="*"
-    printf '%-2s %-10s %-19s %s %-3s %s\n' "$idx" "${ws:--}" "${title:0:19}" "$(state_sym "$state")" "$age" "$mark"
+    printf '%s\t' "$wid"
+    if (( wscol )); then
+      printf '%s %s %-2s %-8s %-*s %-3s %s\n' \
+        "$(state_sym "$state")" "$(state_word "$state")" "$idx" \
+        "$ws" "$tw" "${title:0:$tw}" "$age" "$mark"
+    else
+      printf '%s %s %-2s %-*s %-3s %s\n' \
+        "$(state_sym "$state")" "$(state_word "$state")" "$idx" \
+        "$tw" "${title:0:$tw}" "$age" "$mark"
+    fi
   done
 }
 
 cmd_homelist() { # the left pane process
   local me="$HOME/.claude/bin/cw" refresher
-  rm -f "$PORT_FILE"
+  rm -f "$PORT_FILE" "$ANCHOR_FILE" "$RELOAD_LOCK" "$ORDER_FILE"
   (
     # Refresh the list via fzf's listen port, but only when the rows really
-    # changed: reloads repaint the pane (flicker) and drift the cursor, so
-    # skipping no-op reloads fixes both. The highlight is never moved from
-    # here: an async pos() used to snap it onto the open chat, which could
-    # yank the cursor away in the instant before the user pressed x and
-    # kill the wrong chat. The star column alone marks the open chat now.
+    # changed: reloads repaint the pane (flicker), so skipping no-op reloads
+    # keeps it calm. reload-sync keeps the old rows on screen until the new
+    # ones are complete, and --track --id-nth=1 makes fzf move the cursor
+    # with its window id the instant the rows land, so the highlight never
+    # sits on the wrong chat while cmd_anchorpos catches up. Take RELOAD_LOCK first so the focus events fzf fires
+    # while the new rows land cannot overwrite the anchor with whatever row
+    # happens to sit at the old cursor line. cmd_anchorpos drops the lock
+    # and puts the cursor back on the anchored session.
     # the refresher must survive anything: one transient failure under the
     # script's errexit killed it silently and froze the list
     set +e +o pipefail
-    last_hash=""
+    last_hash=""; last_reload=0
     while :; do
-      sleep 3
+      sleep "$HOME_POLL"
       p="$(cat "$PORT_FILE" 2>/dev/null || true)"
       [[ -n "$p" ]] || continue
-      h="$("$me" __homerows 2>/dev/null | cksum || true)"
-      [[ -n "$h" && "$h" == "$last_hash" ]] && continue
-      last_hash="$h"
+      # the age column rolls over on its own once a minute per session, so
+      # it is dropped from the comparison and refreshed on HOME_AGE_TICK
+      h="$("$me" __homerows 2>/dev/null | sed -E 's/ [0-9?]+[mh]? *(\*?)$/ \1/' | cksum || true)"
+      now="$(date +%s)"
+      if [[ -n "$h" && "$h" == "$last_hash" ]] && (( now - last_reload < HOME_AGE_TICK )); then
+        continue
+      fi
+      last_hash="$h"; last_reload="$now"
+      : > "$RELOAD_LOCK"
       curl -s -X POST "http://localhost:$p" \
-        -d "reload($me __homerows)" >/dev/null 2>&1 || true
+        -d "reload-sync($me __homerows)" >/dev/null 2>&1 || rm -f "$RELOAD_LOCK"
     done
   ) &
   refresher=$!
@@ -474,14 +807,19 @@ cmd_homelist() { # the left pane process
   while :; do
     "$me" __homerows | fzf \
       --disabled --no-info --layout=reverse \
+      --delimiter=$'\t' --with-nth='2..' \
+      --track --id-nth=1 \
       --prompt='' \
-      --header='enter open  m master  n new  x kill' \
+      --header='enter open  m master  n new  x kill  ^r reload' \
       --listen \
       --bind "start:execute-silent(echo \$FZF_PORT > $PORT_FILE)" \
-      --bind "enter:execute-silent($me __open {1})" \
-      --bind "m:execute-silent($me __gomaster)+reload($me __homerows)" \
-      --bind "n:execute($me __newtask)+reload($me __homerows)" \
-      --bind "x:execute-silent($me __guardkill {1})+reload($me __homerows)+first" \
+      --bind "focus:execute-silent($me __anchor {1} {n})" \
+      --bind "load:transform($me __anchorpos)" \
+      --bind "enter:execute-silent($me __open {1})+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "ctrl-r:execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "m:execute-silent($me __gomaster)+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "n:execute($me __newtask)+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
+      --bind "x:execute($me __guardkill {1})+execute-silent($me __reloadlock)+reload-sync($me __homerows)" \
       --bind 'esc:ignore' || true
     sleep 1
   done
@@ -522,7 +860,8 @@ headless=0
 case "${1:-}" in
   ls|list)  cmd_ls; exit 0 ;;
   ui)       cmd_ui; exit 0 ;;
-  __rows)   rows; exit 0 ;;
+  __rows)   rows --with-id; exit 0 ;;
+  __kill)   kill_by_id "${2:-}"; exit 0 ;;
   a|attach) shift; attach_to "$( [[ $# -ge 1 ]] && resolve_target "$1" || echo "" )"; exit 0 ;;
   peek)     shift; [[ $# -ge 1 ]] || { echo "usage: cw peek <id> [lines]" >&2; exit 1; }
             cmd_peek "$@"; exit 0 ;;
@@ -533,10 +872,14 @@ case "${1:-}" in
   master)   shift || true; cmd_master "${1:-}"; exit 0 ;;
   home)     shift || true; cmd_home "${1:-}"; exit 0 ;;
   __homerows) cmd_homerows; exit 0 ;;
+  __lastmsg) window_lastmsg "${2:?index}"; exit 0 ;;
   __homelist) cmd_homelist; exit 0 ;;
   __open)     shift; cmd_open "${1:-}"; exit 0 ;;
   __gomaster) cmd_gomaster; exit 0 ;;
   __guardkill) shift; cmd_guardkill "${1:-}"; exit 0 ;;
+  __anchor)    shift; cmd_anchor "${1:-}" "${2:-0}"; exit 0 ;;
+  __anchorpos) cmd_anchorpos; exit 0 ;;
+  __reloadlock) cmd_reloadlock; exit 0 ;;
   __newtask)  cmd_newtask; exit 0 ;;
   route)    shift; [[ $# -ge 1 ]] || { echo "usage: cw route \"task\"" >&2; exit 1; }
             route_decide "$*"
