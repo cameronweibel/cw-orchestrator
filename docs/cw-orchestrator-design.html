@@ -319,6 +319,12 @@ tmux new-window -t ws \
 </section>
 
 <!-- ============ FILES ============ -->
+<section class="card" id="voice">
+  <h2>Voice from the phone</h2>
+  <p class="lead">Claude Code has no voice mode. The ChatGPT app offers voice inside a Codex session on a paired computer, so speech travels through Codex, and Codex passes every message to the Claude master session with <code>ask-master</code>. The master keeps the context and the tools. On the first message the relay says it is loading your context from the master session, and the master re-reads its plan and notes before it answers.</p>
+  <div class="diagram"><img src="voice-relay.svg" alt="Voice relay from a phone to the Claude master session" style="display:block;width:100%;height:auto;min-width:760px"></div>
+</section>
+
 <section class="card">
   <h2>What gets created</h2>
   <table>
@@ -593,7 +599,7 @@ workspace=convolving tier=agent confidence=0.98
   })();
 </script>
 
-<footer>cw orchestrator design, updated 21 Aug 2026</footer>
+<footer>cw orchestrator design, updated 22 Nov 2026</footer>
 
 </div>
 </body>

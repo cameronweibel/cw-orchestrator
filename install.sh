@@ -27,7 +27,8 @@ mkdir -p "$bin_dir" "$orc_dir" "$profiles_dir" "$workspaces_dir"
 # The scripts are always updated to the repo version.
 cp "$repo/bin/cw" "$bin_dir/cw"
 cp "$repo/bin/claude-ws" "$bin_dir/claude-ws"
-chmod +x "$bin_dir/cw" "$bin_dir/claude-ws"
+cp "$repo/bin/ask-master" "$bin_dir/ask-master"
+chmod +x "$bin_dir/cw" "$bin_dir/claude-ws" "$bin_dir/ask-master"
 echo "Installed $bin_dir/cw and $bin_dir/claude-ws"
 
 # Config files are only seeded when absent.

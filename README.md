@@ -96,6 +96,31 @@ Every decision is logged to `~/.claude/orchestrator/routing.log`.
 
 `cw home` is the always on control room: a 44 column list pane on the left (live states, refreshed every few seconds, a star on the chat currently open) and the selected session filling the rest of the screen as a normal Claude Code terminal. Arrow keys move the highlight, Enter opens the highlighted chat, `m` jumps to the master, `n` spawns a new routed task, `x` kills the highlighted session (refused while busy), ctrl+t hops focus between list and chat, and the mouse works. Close the terminal and nothing dies; `cw home` reattaches.
 
+## Voice from your phone
+
+Claude Code has no voice mode, and the Claude app's voice mode does not reach a Remote Control session. The ChatGPT app does offer voice inside a Codex session on a paired computer. So the voice path runs through Codex, and Codex passes every message to the Claude master session.
+
+![Voice relay from a phone to the Claude master session](docs/voice-relay.svg)
+
+The pieces on the always-on machine:
+
+- **The master session** runs in tmux under a fixed session id, started with `claude --remote-control master`. You can also reach it by text from the Claude app.
+- **`ask-master`** sends one message to that session and prints its reply. It types with `tmux send-keys` and reads the answer from the session transcript, so the text is exact. `ask-master --load` asks the master to re-read its plan and notes, `--voice` marks a turn as spoken, `--last` fetches a reply that took longer than the wait, `--status` prints busy or idle.
+- **The Codex session** is a pure relay. Append `templates/voice-relay.md` to `~/.codex/AGENTS.md` on that machine. On the first message of a conversation it says it is loading your context from the master session, runs `ask-master --load`, and then relays every turn.
+
+Setup on the machine:
+
+```bash
+npm i -g @openai/codex && codex login --device-auth
+cp bin/ask-master ~/.claude/bin/ && chmod +x ~/.claude/bin/ask-master
+cat templates/voice-relay.md >> ~/.codex/AGENTS.md
+echo "<the master's session id>" > ~/.claude/orchestrator/master.sid
+codex remote-control start -c sandbox_mode='"danger-full-access"' -c approval_policy='"never"'
+codex remote-control pair     # enter the code in the ChatGPT app, once
+```
+
+The relay runs without a sandbox because it has to reach tmux and the transcript. Its instructions limit it to `ask-master`, which is a rule the model follows and no hard lock. The master still asks before anything is sent or changed, and the relay puts that question to you.
+
 ## Files
 
 ```
@@ -108,6 +133,9 @@ Every decision is logged to `~/.claude/orchestrator/routing.log`.
 ~/.claude/orchestrator/routing.md      plain language routing rules
 ~/.claude/orchestrator/routing.log     every routing decision
 ~/.claude/orchestrator/master.md       the master session's instructions
+~/.claude/bin/ask-master               relay one message to the master, print its reply
+~/.claude/orchestrator/master.sid      the master's session id, read by ask-master
+~/.claude/orchestrator/voice-load.md   optional text that ask-master --load sends
 ```
 
 ## Troubleshooting

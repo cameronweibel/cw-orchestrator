@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Relay one message to the Claude master session on this machine and print its reply.
+
+    ask-master "text"        send, wait for the reply (up to --wait seconds), print it
+    ask-master --voice "t"   same, and tell the master this turn is spoken
+    ask-master --load        ask the master to load its context, print its confirmation
+    ask-master --last        print the most recent reply without sending anything
+    ask-master --status      say whether the master session is busy or idle
+
+The master is a Claude Code session in a tmux session. Text goes in with tmux
+send-keys. Replies are read from the session transcript, so the text is exact,
+not scraped from the screen. Any agent that can run a shell command can use
+this, which is how a Codex session reached from a phone talks to the master.
+
+Settings, all optional:
+    ASK_MASTER_TMUX   tmux session name of the master (default claude-master)
+    ASK_MASTER_SID    the master's Claude session id (default: the newest transcript)
+    ~/.claude/orchestrator/voice-load.md   the text --load sends
+"""
+import argparse, glob, json, os, subprocess, sys, time
+
+TMUX = os.environ.get("ASK_MASTER_TMUX", "claude-master")
+SID = os.environ.get("ASK_MASTER_SID", "")
+SID_FILE = os.path.expanduser("~/.claude/orchestrator/master.sid")
+if not SID and os.path.exists(SID_FILE):
+    SID = open(SID_FILE).read().strip()
+LOAD_FILE = os.path.expanduser("~/.claude/orchestrator/voice-load.md")
+VOICE = "[By voice from the phone, relayed through another agent. Talk it through: answer in a few short spoken sentences, no tables, lists, links or file paths.] "
+LOAD = "[A voice session is starting, relayed through another agent.] Before the first question, re-read your plan and notes so you answer from the current state. Then reply in two short spoken sentences saying what you loaded."
+
+
+def transcript():
+    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{SID or '*'}.jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+def entries(path, start=0):
+    out = []
+    with open(path) as f:
+        for i, line in enumerate(f):
+            if i < start:
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+    return out
+
+
+def count(path):
+    with open(path) as f:
+        return sum(1 for _ in f)
+
+
+def texts(rows):
+    out = []
+    for r in rows:
+        if r.get("type") != "assistant" or r.get("isSidechain"):
+            continue
+        for b in (r.get("message") or {}).get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip():
+                out.append(b["text"].strip())
+    return out
+
+
+def pane():
+    return subprocess.run(["tmux", "capture-pane", "-t", TMUX, "-p"], capture_output=True, text=True).stdout
+
+
+def busy():
+    return "esc to interrupt" in pane()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("text", nargs="*")
+    ap.add_argument("--last", action="store_true")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--load", action="store_true", help="ask the master to load its context first")
+    ap.add_argument("--wait", type=int, default=150)
+    ap.add_argument("--voice", action="store_true", help="tell the master this turn is spoken")
+    a = ap.parse_args()
+    if subprocess.run(["tmux", "has-session", "-t", TMUX], capture_output=True).returncode:
+        sys.exit("The master session is not running. Start it with: systemctl --user restart claude-master")
+    path = transcript()
+    if a.status:
+        print("busy" if busy() else "idle")
+        return
+    if a.last:
+        t = texts(entries(path)) if path else []
+        print(t[-1] if t else "No reply yet.")
+        if busy():
+            print("\n(The master session is still working.)")
+        return
+    if a.load:
+        msg = open(LOAD_FILE).read() if os.path.exists(LOAD_FILE) else LOAD
+        a.voice = False
+    else:
+        msg = " ".join(a.text)
+    msg = " ".join(msg.split())
+    if not msg:
+        sys.exit("Nothing to send.")
+    if a.voice:
+        msg = VOICE + msg
+    if busy():
+        sys.exit("The master session is busy with an earlier request. Try again shortly, or run: ask-master --last")
+    start = count(path) if path else 0
+    subprocess.run(["tmux", "send-keys", "-t", TMUX, "-l", msg], check=True)
+    time.sleep(0.8)
+    subprocess.run(["tmux", "send-keys", "-t", TMUX, "Enter"], check=True)
+    deadline = time.time() + a.wait
+    time.sleep(4)
+    while time.time() < deadline:
+        path = path or transcript()
+        new = texts(entries(path, start)) if path else []
+        if new and not busy():
+            time.sleep(2)
+            if not busy():
+                print(texts(entries(path, start))[-1])
+                return
+        time.sleep(3)
+    new = texts(entries(path, start)) if path else []
+    print("The master session is still working on it. Ask again in a minute with: ask-master --last")
+    if new:
+        print("\nSo far it said:\n" + new[-1])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 640" width="1060" height="640" role="img" aria-labelledby="t d" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<title id="t">Voice relay from a phone to the Claude master session</title>
+<desc id="d">Speech goes from the ChatGPT app through Codex remote control to a Codex session on the always-on machine. That session passes each message to the Claude master session with the ask-master command and reads the reply back. The Claude app reaches the same master session by text through Claude Remote Control.</desc>
+<defs>
+<marker id="ax" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#2563eb"/></marker>
+<marker id="al" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b45309"/></marker>
+<marker id="ai" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#5b6472"/></marker>
+</defs>
+<rect width="1060" height="640" rx="16" fill="#f4f5f7"/>
+<rect x="24" y="24" width="214" height="330" rx="14" fill="none" stroke="#d7dbe2" stroke-width="1.5" stroke-dasharray="5 5"/>
+<text x="40" y="50" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">YOUR PHONE</text>
+<rect x="262" y="24" width="214" height="330" rx="14" fill="none" stroke="#d7dbe2" stroke-width="1.5" stroke-dasharray="5 5"/>
+<text x="278" y="50" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">VENDOR RELAY</text>
+<text x="278" y="68" font-size="12.5" fill="#5b6472">No port is opened at home</text>
+<rect x="500" y="24" width="536" height="592" rx="14" fill="none" stroke="#d7dbe2" stroke-width="1.5" stroke-dasharray="5 5"/>
+<text x="516" y="50" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">ALWAYS-ON MACHINE</text>
+<text x="516" y="68" font-size="12.5" fill="#5b6472">A Raspberry Pi here. Sessions live in tmux and survive a closed phone.</text>
+<rect x="40" y="96" width="182" height="96" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="54" y="121" font-size="15" font-weight="650" fill="#1c2330">ChatGPT app</text>
+<text x="54" y="141" font-size="12.5" fill="#5b6472">Codex, voice mode</text>
+<text x="54" y="158" font-size="12.5" fill="#5b6472">You talk, it talks back</text>
+<rect x="40" y="232" width="182" height="96" rx="10" fill="#ffffff" stroke="#b45309" stroke-width="1.6"/>
+<text x="54" y="257" font-size="15" font-weight="650" fill="#1c2330">Claude app</text>
+<text x="54" y="277" font-size="12.5" fill="#5b6472">Code tab, text chat</text>
+<text x="54" y="294" font-size="12.5" fill="#5b6472">Voice mode is not offered</text>
+<rect x="278" y="96" width="182" height="96" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="292" y="121" font-size="15" font-weight="650" fill="#1c2330">Codex</text>
+<text x="292" y="141" font-size="12.5" fill="#5b6472">remote control</text>
+<text x="292" y="158" font-size="12.5" fill="#5b6472">pairs once with a code</text>
+<rect x="278" y="232" width="182" height="96" rx="10" fill="#ffffff" stroke="#b45309" stroke-width="1.6"/>
+<text x="292" y="257" font-size="15" font-weight="650" fill="#1c2330">Claude</text>
+<text x="292" y="277" font-size="12.5" fill="#5b6472">Remote Control</text>
+<text x="292" y="294" font-size="12.5" fill="#5b6472">session named master</text>
+<rect x="524" y="96" width="250" height="96" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="538" y="121" font-size="15" font-weight="650" fill="#1c2330">Codex session</text>
+<text x="538" y="141" font-size="12.5" fill="#5b6472">Pure relay. Holds no context.</text>
+<text x="538" y="158" font-size="12.5" fill="#5b6472">Rules in ~/.codex/AGENTS.md</text>
+<rect x="524" y="246" width="250" height="96" rx="10" fill="#ffffff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="538" y="271" font-size="15" font-weight="650" fill="#1c2330">ask-master</text>
+<text x="538" y="291" font-size="12.5" fill="#5b6472">Types your words into the master</text>
+<text x="538" y="308" font-size="12.5" fill="#5b6472">Reads the exact reply from the</text>
+<text x="538" y="325" font-size="12.5" fill="#5b6472">session transcript</text>
+<rect x="524" y="396" width="250" height="196" rx="10" fill="#1c2330" stroke="#1c2330" stroke-width="1.6"/>
+<text x="538" y="421" font-size="15" font-weight="650" fill="#ffffff">Claude master session</text>
+<text x="538" y="441" font-size="12.5" fill="#c3cad6">tmux session claude-master</text>
+<text x="538" y="458" font-size="12.5" fill="#c3cad6">Keeps the thread of the talk</text>
+<text x="538" y="475" font-size="12.5" fill="#c3cad6">Holds the plan and the skills</text>
+<text x="538" y="492" font-size="12.5" fill="#c3cad6"></text>
+<text x="538" y="509" font-size="12.5" fill="#c3cad6">On the first message it reloads</text>
+<text x="538" y="526" font-size="12.5" fill="#c3cad6">its plan and notes, and the</text>
+<text x="538" y="543" font-size="12.5" fill="#c3cad6">relay tells you so.</text>
+<rect x="812" y="96" width="200" height="78" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="826" y="121" font-size="15" font-weight="650" fill="#1c2330">Plan and log</text>
+<text x="826" y="141" font-size="12.5" fill="#5b6472">Read and updated</text>
+<text x="826" y="158" font-size="12.5" fill="#5b6472">by the master</text>
+<rect x="812" y="196" width="200" height="78" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="826" y="221" font-size="15" font-weight="650" fill="#1c2330">Mail, payments, data</text>
+<text x="826" y="241" font-size="12.5" fill="#5b6472">Read access through</text>
+<text x="826" y="258" font-size="12.5" fill="#5b6472">the master's tools</text>
+<rect x="812" y="296" width="200" height="78" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="826" y="321" font-size="15" font-weight="650" fill="#1c2330">Worker sessions</text>
+<text x="826" y="341" font-size="12.5" fill="#5b6472">Spawned and steered</text>
+<text x="826" y="358" font-size="12.5" fill="#5b6472">with cw</text>
+<rect x="812" y="396" width="200" height="96" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="826" y="421" font-size="15" font-weight="650" fill="#1c2330">Your yes</text>
+<text x="826" y="441" font-size="12.5" fill="#5b6472">Anything sent or changed</text>
+<text x="826" y="458" font-size="12.5" fill="#5b6472">comes back to you as a</text>
+<text x="826" y="475" font-size="12.5" fill="#5b6472">question first</text>
+<line x1="224" y1="144" x2="276" y2="144" stroke="#2563eb" stroke-width="2.2" marker-end="url(#ax)" marker-start="url(#ax)"/>
+<circle cx="250" cy="122" r="11" fill="#2563eb"/><text x="250" y="126.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">1</text>
+<line x1="462" y1="144" x2="522" y2="144" stroke="#2563eb" stroke-width="2.2" marker-end="url(#ax)" marker-start="url(#ax)"/>
+<circle cx="492" cy="122" r="11" fill="#2563eb"/><text x="492" y="126.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">2</text>
+<line x1="649" y1="194" x2="649" y2="244" stroke="#2563eb" stroke-width="2.2" marker-end="url(#ax)" marker-start="url(#ax)"/>
+<circle cx="676" cy="219" r="11" fill="#2563eb"/><text x="676" y="223.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">3</text>
+<line x1="649" y1="344" x2="649" y2="394" stroke="#2563eb" stroke-width="2.2" marker-end="url(#ax)" marker-start="url(#ax)"/>
+<circle cx="676" cy="369" r="11" fill="#2563eb"/><text x="676" y="373.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">4</text>
+<line x1="224" y1="280" x2="276" y2="280" stroke="#b45309" stroke-width="2.2" marker-end="url(#al)" marker-start="url(#al)"/>
+<path d="M462 280 H492 V494 H522" fill="none" stroke="#b45309" stroke-width="2.2" marker-end="url(#al)" marker-start="url(#al)"/>
+<path d="M776 440 H793 V135 H810" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ai)"/>
+<path d="M776 440 H793 V235 H810" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ai)"/>
+<path d="M776 440 H793 V335 H810" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ai)"/>
+<line x1="776" y1="470" x2="810" y2="470" stroke="#5b6472" stroke-width="2.2" stroke-dasharray="5 4" marker-end="url(#ai)"/>
+<text x="40" y="392" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">THE VOICE PATH</text>
+<circle cx="51" cy="416" r="11" fill="#2563eb"/><text x="51" y="420.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">1</text>
+<text x="72" y="420" font-size="13" fill="#1c2330">You speak. The app turns speech into text and reads replies aloud.</text>
+<circle cx="51" cy="442" r="11" fill="#2563eb"/><text x="51" y="446.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">2</text>
+<text x="72" y="446" font-size="13" fill="#1c2330">The Codex session on the machine receives each message.</text>
+<circle cx="51" cy="468" r="11" fill="#2563eb"/><text x="51" y="472.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">3</text>
+<text x="72" y="472" font-size="13" fill="#1c2330">It runs ask-master, which passes your words on unchanged.</text>
+<circle cx="51" cy="494" r="11" fill="#2563eb"/><text x="51" y="498.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">4</text>
+<text x="72" y="498" font-size="13" fill="#1c2330">The master answers from its context and tools. The reply</text>
+<text x="72" y="517" font-size="13" fill="#1c2330">travels back the same way, word for word.</text>
+<line x1="40" y1="552" x2="72" y2="552" stroke="#2563eb" stroke-width="2.6"/><text x="82" y="557" font-size="13" fill="#5b6472">Voice, through Codex</text>
+<line x1="250" y1="552" x2="282" y2="552" stroke="#b45309" stroke-width="2.6"/><text x="292" y="557" font-size="13" fill="#5b6472">Text, direct to the master</text>
+<line x1="40" y1="576" x2="72" y2="576" stroke="#5b6472" stroke-width="1.8" stroke-dasharray="5 4"/><text x="82" y="581" font-size="13" fill="#5b6472">What the master reaches</text>
+</svg>
