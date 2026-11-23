@@ -13,8 +13,10 @@ not scraped from the screen. Any agent that can run a shell command can use
 this, which is how a Codex session reached from a phone talks to the master.
 
 Settings, all optional:
-    ASK_MASTER_TMUX    tmux target of the master, a session or session:window
-                       (default claude-master; the cw master is ws:0)
+    ASK_MASTER_TMUX    tmux target of the master, a session or session:window.
+                       Without it the target comes from the file
+                       ~/.claude/orchestrator/master.target, then claude-master.
+                       The cw master is ws:0
     ASK_MASTER_SOCKET  tmux socket name, as in tmux -L (cw uses "default")
     ASK_MASTER_SID     the master's Claude session id. Without it the id comes
                        from master.sid, then from the window's @cw_sid option
@@ -22,7 +24,8 @@ Settings, all optional:
 """
 import argparse, glob, json, os, subprocess, sys, time
 
-TMUX = os.environ.get("ASK_MASTER_TMUX", "claude-master")
+TARGET_FILE = os.path.expanduser("~/.claude/orchestrator/master.target")
+TMUX = os.environ.get("ASK_MASTER_TMUX") or (open(TARGET_FILE).read().strip() if os.path.exists(TARGET_FILE) else "claude-master")
 SOCKET = os.environ.get("ASK_MASTER_SOCKET", "")
 SID_FILE = os.path.expanduser("~/.claude/orchestrator/master.sid")
 
