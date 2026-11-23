@@ -121,6 +121,12 @@ codex remote-control pair     # enter the code in the ChatGPT app, once
 
 The relay runs without a sandbox because it has to reach tmux and the transcript. Its instructions limit it to `ask-master`, which is a rule the model follows and no hard lock. The master still asks before anything is sent or changed, and the relay puts that question to you.
 
+## The cw connector for the Claude apps
+
+`connector/` holds a remote MCP server that you add to Claude as a custom connector. Claude on the phone, desktop or web can then list, peek at, instruct and start cw sessions on your Mac, ask the master session, and read past outputs and transcripts. It is locked with OAuth and a pairing step on the Mac, and it has no kill, shell or write tool. Setup and the security model are in [connector/README.md](connector/README.md).
+
+![How the cw connector works](docs/connector.svg)
+
 ## Files
 
 ```

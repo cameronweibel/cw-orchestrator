@@ -13,17 +13,35 @@ not scraped from the screen. Any agent that can run a shell command can use
 this, which is how a Codex session reached from a phone talks to the master.
 
 Settings, all optional:
-    ASK_MASTER_TMUX   tmux session name of the master (default claude-master)
-    ASK_MASTER_SID    the master's Claude session id (default: the newest transcript)
+    ASK_MASTER_TMUX    tmux target of the master, a session or session:window
+                       (default claude-master; the cw master is ws:0)
+    ASK_MASTER_SOCKET  tmux socket name, as in tmux -L (cw uses "default")
+    ASK_MASTER_SID     the master's Claude session id. Without it the id comes
+                       from master.sid, then from the window's @cw_sid option
     ~/.claude/orchestrator/voice-load.md   the text --load sends
 """
 import argparse, glob, json, os, subprocess, sys, time
 
 TMUX = os.environ.get("ASK_MASTER_TMUX", "claude-master")
-SID = os.environ.get("ASK_MASTER_SID", "")
+SOCKET = os.environ.get("ASK_MASTER_SOCKET", "")
 SID_FILE = os.path.expanduser("~/.claude/orchestrator/master.sid")
-if not SID and os.path.exists(SID_FILE):
-    SID = open(SID_FILE).read().strip()
+
+
+def tmux(*args):
+    cmd = ["tmux"] + (["-L", SOCKET] if SOCKET else []) + list(args)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def find_sid():
+    sid = os.environ.get("ASK_MASTER_SID", "")
+    if not sid and os.path.exists(SID_FILE) and "ASK_MASTER_TMUX" not in os.environ:
+        sid = open(SID_FILE).read().strip()
+    if not sid:
+        sid = tmux("show-options", "-wqv", "-t", TMUX, "@cw_sid").stdout.strip()
+    return sid
+
+
+SID = find_sid()
 LOAD_FILE = os.path.expanduser("~/.claude/orchestrator/voice-load.md")
 VOICE = "[By voice from the phone, relayed through another agent. Talk it through: answer in a few short spoken sentences, no tables, lists, links or file paths.] "
 LOAD = "[A voice session is starting, relayed through another agent.] Before the first question, re-read your plan and notes so you answer from the current state. Then reply in two short spoken sentences saying what you loaded."
@@ -64,7 +82,7 @@ def texts(rows):
 
 
 def pane():
-    return subprocess.run(["tmux", "capture-pane", "-t", TMUX, "-p"], capture_output=True, text=True).stdout
+    return tmux("capture-pane", "-t", TMUX, "-p").stdout
 
 
 def busy():
@@ -80,8 +98,8 @@ def main():
     ap.add_argument("--wait", type=int, default=150)
     ap.add_argument("--voice", action="store_true", help="tell the master this turn is spoken")
     a = ap.parse_args()
-    if subprocess.run(["tmux", "has-session", "-t", TMUX], capture_output=True).returncode:
-        sys.exit("The master session is not running. Start it with: systemctl --user restart claude-master")
+    if tmux("display-message", "-p", "-t", TMUX, "#{pane_id}").returncode:
+        sys.exit("The master session is not running.")
     path = transcript()
     if a.status:
         print("busy" if busy() else "idle")
@@ -105,9 +123,9 @@ def main():
     if busy():
         sys.exit("The master session is busy with an earlier request. Try again shortly, or run: ask-master --last")
     start = count(path) if path else 0
-    subprocess.run(["tmux", "send-keys", "-t", TMUX, "-l", msg], check=True)
+    tmux("send-keys", "-t", TMUX, "-l", "--", msg)
     time.sleep(0.8)
-    subprocess.run(["tmux", "send-keys", "-t", TMUX, "Enter"], check=True)
+    tmux("send-keys", "-t", TMUX, "Enter")
     deadline = time.time() + a.wait
     time.sleep(4)
     while time.time() < deadline:

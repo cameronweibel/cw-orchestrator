@@ -1,0 +1,14 @@
+{
+  "public_url": "https://cw.example.com",
+  "port": 8787,
+  "ip_allow": ["160.79.104.0/21"],
+  "tmux_socket": "default",
+  "tmux_session": "ws",
+  "master_window": "0",
+  "roots": {
+    "out": ["~/path/to/workspaces/*/out"],
+    "memory": ["~/.claude/projects/*/memory"],
+    "transcripts": ["~/.claude/projects"],
+    "repo": ["~/path/to/cw-orchestrator"]
+  }
+}

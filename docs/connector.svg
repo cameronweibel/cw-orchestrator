@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 520" width="1060" height="520" role="img" aria-labelledby="t d" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<title id="t">How the cw connector works</title>
+<desc id="d">The Claude app calls the connector through Claude's servers and an HTTPS tunnel. The connector on the Mac checks the token and the caller address, then runs cw commands, asks the master session, or reads fixed local folders.</desc>
+<defs><marker id="m" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b45309"/></marker><marker id="g" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="5.5" markerHeight="5.5" orient="auto"><path d="M0 0L10 5L0 10z" fill="#5b6472"/></marker></defs>
+<rect width="1060" height="520" rx="16" fill="#f4f5f7"/>
+<rect x="24" y="24" width="200" height="250" rx="14" fill="none" stroke="#d7dbe2" stroke-width="1.5" stroke-dasharray="5 5"/>
+<text x="40" y="50" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">YOU</text>
+<rect x="248" y="24" width="222" height="250" rx="14" fill="none" stroke="#d7dbe2" stroke-width="1.5" stroke-dasharray="5 5"/>
+<text x="264" y="50" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">ON THE WAY</text>
+<text x="264" y="68" font-size="12.5" fill="#5b6472">HTTPS throughout</text>
+<rect x="494" y="24" width="542" height="472" rx="14" fill="none" stroke="#d7dbe2" stroke-width="1.5" stroke-dasharray="5 5"/>
+<text x="510" y="50" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">YOUR MAC</text>
+<text x="510" y="68" font-size="12.5" fill="#5b6472">Awake and logged in. Nothing listens on the network.</text>
+<rect x="40" y="96" width="168" height="96" rx="10" fill="#ffffff" stroke="#b45309" stroke-width="1.6"/>
+<text x="54" y="121" font-size="15" font-weight="650" fill="#1c2330">Claude app</text>
+<text x="54" y="141" font-size="12.5" fill="#5b6472">Phone, desktop or web</text>
+<text x="54" y="158" font-size="12.5" fill="#5b6472">Chat. Voice is untested</text>
+<rect x="264" y="96" width="190" height="62" rx="10" fill="#ffffff" stroke="#b45309" stroke-width="1.6"/>
+<text x="278" y="121" font-size="15" font-weight="650" fill="#1c2330">Claude servers</text>
+<text x="278" y="141" font-size="12.5" fill="#5b6472">Call the connector for you</text>
+<rect x="264" y="190" width="190" height="62" rx="10" fill="#ffffff" stroke="#b45309" stroke-width="1.6"/>
+<text x="278" y="215" font-size="15" font-weight="650" fill="#1c2330">Cloudflare tunnel</text>
+<text x="278" y="235" font-size="12.5" fill="#5b6472">Stable name on your domain</text>
+<rect x="518" y="96" width="232" height="156" rx="10" fill="#1c2330" stroke="#1c2330" stroke-width="1.6"/>
+<text x="532" y="121" font-size="15" font-weight="650" fill="#ffffff">cw connector</text>
+<text x="532" y="141" font-size="12.5" fill="#c3cad6">launchd service on 127.0.0.1</text>
+<text x="532" y="158" font-size="12.5" fill="#c3cad6">Checks the OAuth token</text>
+<text x="532" y="175" font-size="12.5" fill="#c3cad6">Checks the caller's address</text>
+<text x="532" y="192" font-size="12.5" fill="#c3cad6">Logs every call</text>
+<text x="532" y="209" font-size="12.5" fill="#c3cad6">No kill, no shell, no writes</text>
+<rect x="796" y="96" width="216" height="78" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="810" y="121" font-size="15" font-weight="650" fill="#1c2330">cw</text>
+<text x="810" y="141" font-size="12.5" fill="#5b6472">list, peek, send, spawn, route</text>
+<rect x="796" y="196" width="216" height="78" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="810" y="221" font-size="15" font-weight="650" fill="#1c2330">Master session</text>
+<text x="810" y="241" font-size="12.5" fill="#5b6472">Asked through ask-master,</text>
+<text x="810" y="258" font-size="12.5" fill="#5b6472">its reply comes back</text>
+<rect x="796" y="296" width="216" height="78" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="810" y="321" font-size="15" font-weight="650" fill="#1c2330">Worker sessions</text>
+<text x="810" y="341" font-size="12.5" fill="#5b6472">One per task, in tmux</text>
+<rect x="796" y="396" width="216" height="78" rx="10" fill="#ffffff" stroke="#d7dbe2" stroke-width="1.6"/>
+<text x="810" y="421" font-size="15" font-weight="650" fill="#1c2330">Local folders, read only</text>
+<text x="810" y="441" font-size="12.5" fill="#5b6472">Outputs, memory notes,</text>
+<text x="810" y="458" font-size="12.5" fill="#5b6472">transcripts, this repo</text>
+<path d="M210 132 H262" fill="none" stroke="#b45309" stroke-width="2.2" marker-end="url(#m)" marker-start="url(#m)"/>
+<path d="M359 160 V188" fill="none" stroke="#b45309" stroke-width="2.2" marker-end="url(#m)" marker-start="url(#m)"/>
+<path d="M456 221 H486 V174 H516" fill="none" stroke="#b45309" stroke-width="2.2" marker-end="url(#m)" marker-start="url(#m)"/>
+<path d="M752 135 H794" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#g)"/>
+<path d="M752 200 H773 V235 H794" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#g)"/>
+<path d="M752 225 H763 V435 H794" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#g)"/>
+<path d="M904 176 V194" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#g)"/>
+<path d="M904 276 V294" fill="none" stroke="#5b6472" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#g)"/>
+<text x="40" y="312" font-size="13" font-weight="700" fill="#5b6472" letter-spacing=".5">PAIRING, ONCE PER ACCOUNT</text>
+<circle cx="51" cy="336" r="11" fill="#1c2330"/><text x="51" y="340.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">1</text>
+<text x="72" y="340" font-size="13" fill="#1c2330">Open a pairing window on the Mac. It closes by itself.</text>
+<circle cx="51" cy="363" r="11" fill="#1c2330"/><text x="51" y="367.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">2</text>
+<text x="72" y="367" font-size="13" fill="#1c2330">Add the connector in Claude. The browser shows a code.</text>
+<circle cx="51" cy="390" r="11" fill="#1c2330"/><text x="51" y="394.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">3</text>
+<text x="72" y="394" font-size="13" fill="#1c2330">Allow the same code in the dialog on the Mac.</text>
+<circle cx="51" cy="417" r="11" fill="#1c2330"/><text x="51" y="421.5" font-size="12.5" font-weight="700" fill="#fff" text-anchor="middle">4</text>
+<text x="72" y="421" font-size="13" fill="#1c2330">Claude holds a token from then on. No password exists.</text>
+<line x1="40" y1="457" x2="72" y2="457" stroke="#b45309" stroke-width="2.6"/><text x="82" y="462" font-size="13" fill="#5b6472">Requests and replies</text>
+<line x1="250" y1="457" x2="282" y2="457" stroke="#5b6472" stroke-width="1.8" stroke-dasharray="5 4"/><text x="292" y="462" font-size="13" fill="#5b6472">What the connector reaches</text>
+</svg>

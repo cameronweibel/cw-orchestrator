@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Copy to ~/Library/LaunchAgents/com.cw.connector.plist and replace HOME_DIR with your home folder. -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.cw.connector</string>
+  <key>ProgramArguments</key><array>
+    <string>HOME_DIR/.claude/cw-connector/venv/bin/python</string>
+    <string>HOME_DIR/.claude/cw-connector/cw_connector.py</string>
+    <string>serve</string>
+  </array>
+  <key>WorkingDirectory</key><string>HOME_DIR</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardOutPath</key><string>HOME_DIR/.claude/cw-connector/serve.log</string>
+  <key>StandardErrorPath</key><string>HOME_DIR/.claude/cw-connector/serve.log</string>
+</dict></plist>
