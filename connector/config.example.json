@@ -5,6 +5,7 @@
   "tmux_socket": "default",
   "tmux_session": "ws",
   "master_window": "0",
+  "machine": "Mac",
   "roots": {
     "out": ["~/path/to/workspaces/*/out"],
     "memory": ["~/.claude/projects/*/memory"],

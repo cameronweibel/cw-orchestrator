@@ -43,6 +43,9 @@ DEFAULTS = {
     "tmux_socket": "default",
     "tmux_session": "ws",
     "master_window": "0",
+    "master_target": "",
+    "master_sid": "",
+    "machine": "Mac",
     "access_ttl": 3600,
     "refresh_ttl_days": 60,
     "spawns_per_hour": 10,
@@ -189,7 +192,7 @@ def serve():
     # Sessions that cw spawns inherit this PATH, so it has to be the login shell's, not launchd's bare one.
     base_path = f"{BIN}:{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
     try:
-        shell = os.environ.get("SHELL") or "/bin/zsh"
+        shell = os.environ.get("SHELL") or next(s for s in ("/bin/zsh", "/bin/bash", "/bin/sh") if os.path.exists(s))
         got = subprocess.run([shell, "-lic", "printf '\\n__PATH__%s' \"$PATH\""], capture_output=True, text=True,
                              timeout=20, stdin=subprocess.DEVNULL).stdout
         login_path = got.rsplit("__PATH__", 1)[1].strip() if "__PATH__" in got else ""
@@ -362,8 +365,8 @@ def serve():
     mcp = MCPServer(
         name="cw",
         instructions=(
-            "Controls the owner's cw sessions on their Mac. Each session is a Claude Code agent working in one "
-            "workspace. The master session (id 0) knows about every other session and is the best place for open "
+            f"Controls the owner's cw sessions on their {cfg['machine']}. Each session is a Claude Code agent working in one "
+            "workspace. The master session knows about every other session and is the best place for open "
             "questions: use ask_master for those. Use list_sessions and peek_session to see what is running, "
             "send_to_session to instruct one session, spawn_session to start new work. search_local and read_local "
             "read past outputs, memory notes and session transcripts. Nothing here can kill a session, run a shell "
@@ -404,7 +407,7 @@ async function tick(){
 tick();
 </script>"""
     MESSAGES = {
-        "closed": ("Pairing is closed", "Open a pairing window on the Mac with the command cw-connector pair, then add the connector again."),
+        "closed": ("Pairing is closed", f"Open a pairing window on the {cfg['machine']} with the command cw-connector pair, then add the connector again."),
         "busy": ("Too many requests are waiting", "Try again in a few minutes."),
         "denied": ("The request was refused", "Nothing was connected."),
         "expired": ("The request ran out of time", "Add the connector again to get a new code."),
@@ -420,7 +423,11 @@ tick();
         status = p["status"] if p else "gone"
         if status == "waiting":
             code = p["code"][:4] + "-" + p["code"][4:]
-            body = ("<h1>Approve this on your Mac</h1><p>A dialog on the Mac shows a code. Allow it only if it matches this one.</p>"
+            machine = html.escape(cfg["machine"])
+            how = (f"A dialog on the {machine} shows a code. Allow it only if it matches this one."
+                   if (pairing_window() or {}).get("dialog", True) and sys.platform == "darwin"
+                   else f"On the {machine}, run cw-connector approve with this code.")
+            body = (f"<h1>Approve this on your {machine}</h1><p>{how}</p>"
                     f'<div class="code">{html.escape(code)}</div><p>This page continues by itself once you allow it. The code is valid for five minutes.</p>')
             return HTMLResponse(PAGE.replace("__BODY__", body).replace("__SCRIPT__", POLL), headers=HEADERS)
         title, text = MESSAGES[status]
@@ -589,10 +596,12 @@ tick();
 
     @tool("list_sessions", "List cw sessions", READ)
     def list_sessions() -> str:
-        """List every cw session on the Mac: its number, workspace, title, whether it is busy, how long since its last message, and its task. Session 0 is the master."""
+        """List every cw session on this machine: its number, workspace, title, whether it is busy, how long since its last message, and its task. The master session may not appear in the list; reach it with ask_master."""
         rows = run([str(BIN / "cw"), "ls"], limit=60000).splitlines()
         body = "\n".join(line[:190] + ("..." if len(line) > 190 else "") for line in rows)
-        return f"{max(0, len(rows) - 1)} sessions in total, all listed below. Long task texts are shortened.\n{body}"
+        if len(rows) < 2:
+            return f"No worker sessions are running on this {cfg['machine']}. The master session is reached with ask_master."
+        return f"{len(rows) - 1} sessions in total, all listed below. Long task texts are shortened.\n{body}"
 
     @tool("peek_session", "Peek at a session", READ)
     def peek_session(session: str, lines: int = 40) -> str:
@@ -642,7 +651,10 @@ tick();
             return f"cw did not report a new session. Output: {out[:400]}"
         return f"Started session {new[0]} in workspace {ws}. {out.splitlines()[-1][:160]}"
 
-    master_env = {"ASK_MASTER_TMUX": f"{cfg['tmux_session']}:{cfg['master_window']}", "ASK_MASTER_SOCKET": cfg["tmux_socket"]}
+    master_env = {"ASK_MASTER_TMUX": cfg["master_target"] or f"{cfg['tmux_session']}:{cfg['master_window']}",
+                  "ASK_MASTER_SOCKET": cfg["tmux_socket"]}
+    if cfg["master_sid"]:
+        master_env["ASK_MASTER_SID"] = cfg["master_sid"]
 
     @tool("ask_master", "Ask the master session", ACT)
     def ask_master(message: str, wait_seconds: int = 45, spoken: bool = True) -> str:

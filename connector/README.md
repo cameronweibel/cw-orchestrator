@@ -75,6 +75,10 @@ The connector then appears in the mobile apps of the same account.
 
 `smoke_test.py https://cw.example.com` runs the whole flow without a browser: refusals, pairing, PKCE, refresh, and every tool. Add your own address to `ip_allow` for the duration of the test, open a window with `pair --no-dialog`, and remove the address afterwards.
 
+## A second machine
+
+The same server runs on Linux. Give each machine its own host name and add each one to Claude as its own connector. In `config.json` set `machine` to the name Claude should use, and when the master does not live in window 0 of the cw tmux session, set `master_target` to its tmux target and `master_sid` to its Claude session id. Without a desktop there is no dialog, so approve a pairing with `cw_connector.py approve CODE`. Run it from a systemd user service in place of launchd.
+
 ## Limits
 
 - The Mac has to be awake and logged in. Sessions live in tmux in your login session.
